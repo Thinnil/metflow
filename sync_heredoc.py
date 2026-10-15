@@ -1,6 +1,9 @@
-py_file = 'C:/Users/g_san/.gemini/antigravity/scratch/conf_sel/analyze_trajectory.py'
-sh_file = 'C:/Users/g_san/.gemini/antigravity/scratch/conf_sel/restore_metflow.sh'
-bin_file = 'C:/Users/g_san/.gemini/antigravity/scratch/conf_sel/bin/metflow'
+import os
+
+base_dir = os.path.dirname(os.path.abspath(__file__))
+py_file = os.path.join(base_dir, 'analyze_trajectory.py')
+sh_file = os.path.join(base_dir, 'restore_metflow.sh')
+bin_file = os.path.join(base_dir, 'bin', 'metflow')
 
 with open(py_file, 'r', encoding='utf-8') as f:
     py_content = f.read().replace('\r\n', '\n')

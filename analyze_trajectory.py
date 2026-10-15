@@ -14,7 +14,11 @@ if "--only_dashboard" in sys.argv:
                     out_dir = sys.argv[out_idx + 1]
             out_dir_abs = os.path.abspath(out_dir)
             base_dir_abs = os.path.abspath('.')
-            if not (out_dir_abs == base_dir_abs or out_dir_abs.startswith(base_dir_abs + os.sep)):
+            try:
+                if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
+                    print("Error: Directory traversal blocked")
+                    sys.exit(1)
+            except ValueError:
                 print("Error: Directory traversal blocked")
                 sys.exit(1)
             os.makedirs(out_dir_abs, exist_ok=True)
@@ -49,13 +53,13 @@ def install_deps():
         "setuptools": "pkg_resources"
     }
     pins = {
-        "scikit-learn": "scikit-learn>=1.0.0",
-        "scipy": "scipy>=1.8.0",
-        "MDAnalysis": "MDAnalysis>=2.0.0",
-        "pandas": "pandas>=1.5.0",
-        "matplotlib": "matplotlib>=3.5.0",
-        "seaborn": "seaborn>=0.12.0",
-        "setuptools": "setuptools>=60.0.0"
+        "scikit-learn": "scikit-learn==1.4.0",
+        "scipy": "scipy==1.12.0",
+        "MDAnalysis": "MDAnalysis==2.7.0",
+        "pandas": "pandas==2.2.0",
+        "matplotlib": "matplotlib==3.8.3",
+        "seaborn": "seaborn==0.13.2",
+        "setuptools": "setuptools==69.0.0"
     }
     missing = []
     for pkg_name, mod_name in mod_map.items():
@@ -65,14 +69,10 @@ def install_deps():
             missing.append(pins[pkg_name])
     if missing:
         try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + missing, check=True)
-        except Exception:
-            fallback = [m.split(">=")[0] for m in missing]
-            try:
-                subprocess.run([sys.executable, "-m", "pip", "install", "-q"] + fallback, check=True)
-            except Exception as e:
-                print(f"⚠️ Dependency notice: {e}")
-                print(f"👉 Please make sure the MetFlow environment is active: micromamba activate conf_sel_gen")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"] + missing, check=True)
+        except Exception as e:
+            print(f"⚠️ Dependency notice: {e}")
+            print(f"👉 Please make sure the MetFlow environment is active: micromamba activate conf_sel_gen")
 
 install_deps()
 
@@ -120,9 +120,8 @@ def batched_kabsch(P_raw, Q_ref, out=None, chunk_size=1024):
               + R[:, 0, 2] * (R[:, 1, 0] * R[:, 2, 1] - R[:, 1, 1] * R[:, 2, 0]))
         neg_mask = dets < 0
         if np.any(neg_mask):
-            U_corr = U.copy()
-            U_corr[neg_mask, :, 2] *= -1
-            R = np.matmul(U_corr, Vt)
+            U[neg_mask, :, 2] *= -1
+            R[neg_mask] = np.matmul(U[neg_mask], Vt[neg_mask])
         np.matmul(c_centered, R, out=out[start:end])
     return out
 
@@ -139,7 +138,9 @@ def parse_res_string(res_str):
 def parse_list_arg(arg_str):
     if not arg_str:
         return []
-    return [x.strip() for x in arg_str.replace(',', ' ').split() if x.strip()]
+    if ',' in arg_str:
+        return [x.strip() for x in arg_str.split(',') if x.strip()]
+    return [x.strip() for x in arg_str.split() if x.strip()]
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--skim", type=str, default="false")
@@ -173,7 +174,11 @@ args = parser.parse_args()
 
 out_dir_abs = os.path.abspath(args.out_dir)
 base_dir_abs = os.path.abspath('.')
-if not (out_dir_abs == base_dir_abs or out_dir_abs.startswith(base_dir_abs + os.sep)):
+try:
+    if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
+        print("Error: Directory traversal blocked")
+        sys.exit(1)
+except ValueError:
     print("Error: Directory traversal blocked")
     sys.exit(1)
 args.out_dir = out_dir_abs
@@ -190,6 +195,15 @@ if args.only_dashboard.lower() == "true":
     except IndexError:
         print("❌ Error: Could not find HTML block in script source.")
         sys.exit(1)
+    csv_file = os.path.join(out_dir, "global_cluster_metrics.csv")
+    if os.path.exists(csv_file):
+        try:
+            import pandas as pd
+            df_dash = pd.read_csv(csv_file)
+            df_json = df_dash.to_json(orient="records")
+            html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
+        except Exception:
+            pass
     dash_file = os.path.join(out_dir, "metflow_dashboard.html")
     with open(dash_file, "w", encoding="utf-8") as f:
         f.write(html)
@@ -203,7 +217,7 @@ if args.only_energy.lower() == "true":
     args.calc_energy = "true"
 
 print("\n==================================================")
-print("   Initializing Post-Generation Analysis (v2.7 MERGED)")
+print("   Initializing Post-Generation Analysis (v2.8 MULTI-SOURCE)")
 print("==================================================")
 print("--------------------------------------------------")
 
@@ -218,7 +232,7 @@ if args.dataset_configs:
         if len(parts) >= 2:
             p_pdb = parts[0]
             p_xtc = parts[1]
-            p_lbl = parts[2] if len(parts) >= 3 else f"Dataset_{len(dataset_configs)+1}"
+            p_lbl = parts[2] if (len(parts) >= 3 and parts[2]) else os.path.splitext(os.path.basename(p_pdb))[0]
             dataset_configs.append((p_pdb, p_xtc, p_lbl))
 elif args.multi_datasets.lower() == "true" or (len(parse_list_arg(args.pdb)) > 1 and len(parse_list_arg(args.xtc)) > 1):
     pdb_list = parse_list_arg(args.pdb)
@@ -230,7 +244,9 @@ elif args.multi_datasets.lower() == "true" or (len(parse_list_arg(args.pdb)) > 1
         sys.exit(1)
         
     while len(label_list) < len(pdb_list):
-        label_list.append(f"Dataset_{len(label_list) + 1}")
+        curr_pdb = pdb_list[len(label_list)]
+        default_lbl = os.path.splitext(os.path.basename(curr_pdb))[0] or f"Dataset_{len(label_list) + 1}"
+        label_list.append(default_lbl)
         
     dataset_configs = list(zip(pdb_list, xtc_list, label_list))
 else:
@@ -247,7 +263,10 @@ else:
         if not os.path.exists(xtc_path) and os.path.exists("samples.xtc"):
             xtc_path = "samples.xtc"
             pdb_path = "topology.pdb"
-    ds_label = parse_list_arg(args.dataset_labels)[0] if parse_list_arg(args.dataset_labels) else "BioEmu_Ensemble"
+    default_single_lbl = os.path.splitext(os.path.basename(pdb_path))[0] if pdb_path else "BioEmu_Ensemble"
+    if default_single_lbl in ["topology", ""]:
+        default_single_lbl = "BioEmu_Ensemble"
+    ds_label = parse_list_arg(args.dataset_labels)[0] if parse_list_arg(args.dataset_labels) else default_single_lbl
     dataset_configs = [(pdb_path, xtc_path, ds_label)]
 
 master_ref_pdb = dataset_configs[0][0]
@@ -283,7 +302,7 @@ PROTEIN_RESNAMES = {
 def extract_ca_atoms(u_obj):
     if hasattr(u_obj, 'select_atoms'):
         res_q = " ".join(PROTEIN_RESNAMES)
-        protein_atoms = u_obj.select_atoms(f"resname {res_q} and not (name H* or type H)")
+        protein_atoms = u_obj.select_atoms(f"resname {res_q} and not (name H* or name [0-9]H* or type H or element H)")
         target_residues = protein_atoms.residues if len(protein_atoms) > 0 else (u_obj.residues if hasattr(u_obj, 'residues') else [])
     else:
         target_residues = u_obj.residues if hasattr(u_obj, 'residues') else []
@@ -355,7 +374,7 @@ for pdb_p, xtc_p, label in dataset_configs:
         sys.exit(1)
     u_temp = mda.Universe(pdb_p, xtc_p)
     # Whitelist standard and common modified protein residues; strip waters, ions, ligands, explicit hydrogens
-    protein_atoms = u_temp.select_atoms(f"resname {prot_res_str} and not (name H* or type H)")
+    protein_atoms = u_temp.select_atoms(f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)")
     if len(protein_atoms) == 0:
         raise ValueError(f"No protein residues matching PROTEIN_RESNAMES found in {pdb_p}.")
     ca_group = extract_ca_atoms(protein_atoms)
@@ -387,7 +406,7 @@ def res_to_1letter(resname):
 
 dataset_seqs = []
 for _, _, label, _, _, prot_res in temp_universes:
-    s_d = "".join(res_to_1letter(r.resname) for r in prot_res)
+    s_d = "".join(res_to_1letter(rn) for rn in prot_res.resnames)
     dataset_seqs.append(s_d)
 
 pair_ident_cache = {}
@@ -404,32 +423,27 @@ for i in range(len(dataset_seqs)):
             identity = pair_ident_cache[(s2, s1)]
         else:
             max_len = max(len(s1), len(s2))
-            min_len = min(len(s1), len(s2))
             if max_len == 0:
                 identity = 0.0
-            elif min_len / max_len < 0.95:
-                identity = min_len / max_len
-            elif len(s1) == len(s2) and (sum(1 for a, b in zip(s1, s2) if a == b) / max_len) >= 0.95:
-                identity = sum(1 for a, b in zip(s1, s2) if a == b) / max_len
             else:
                 reusable_pair_matcher.set_seqs(s1, s2)
                 matching_blocks = reusable_pair_matcher.get_matching_blocks()
                 identical_count = sum(b.size for b in matching_blocks)
-                identity = identical_count / max_len if max_len > 0 else 0.0
+                identity = identical_count / max_len
             pair_ident_cache[(s1, s2)] = identity
             pair_ident_cache[(s2, s1)] = identity
-        if identity < 0.95:
-            raise ValueError(f"Sequence similarity across datasets '{l1}' and '{l2}' is {identity*100:.1f}%, which is below the 95% threshold.")
+        if identity < 0.90:
+            raise ValueError(f"Sequence similarity across datasets '{l1}' and '{l2}' is {identity*100:.1f}%, which is below the 90.0% threshold.")
 
 ref_prot_res = temp_universes[0][5]
-ref_seq = tuple(normalize_resname(r.resname) for r in ref_prot_res)
+ref_seq = tuple(normalize_resname(rn) for rn in ref_prot_res.resnames)
 ref_seq_len = len(ref_seq)
 
 seq_match_cache = {}
 dataset_matches = []
 reusable_ref_matcher = SequenceMatcher(None, ref_seq, None)
 for _, _, label, _, _, prot_res in temp_universes:
-    ds_seq = tuple(normalize_resname(r.resname) for r in prot_res)
+    ds_seq = tuple(normalize_resname(rn) for rn in prot_res.resnames)
     if ds_seq == ref_seq:
         match_tuple = (0, ref_seq_len, 0, ref_seq_len)
     elif ds_seq in seq_match_cache:
@@ -443,6 +457,23 @@ for _, _, label, _, _, prot_res in temp_universes:
         seq_match_cache[ds_seq] = match_tuple
     dataset_matches.append(match_tuple)
 
+seq_summary_lines = ["\n--- Multi-Source Sequence Verification Summary ---"]
+for idx, (_, _, label, _, _, prot_res) in enumerate(temp_universes):
+    ds_s = dataset_seqs[idx]
+    ds_preview = (ds_s[:4] + "..." + ds_s[-4:]) if len(ds_s) > 10 else ds_s
+    if idx == 0:
+        seq_summary_lines.append(f"Dataset '{label}'       : {len(ds_s)} residues | Sequence {ds_preview}")
+    else:
+        ident_ref = pair_ident_cache.get((dataset_seqs[0], ds_s), pair_ident_cache.get((ds_s, dataset_seqs[0]), 1.0))
+        ref_start, _, ds_start, _ = dataset_matches[idx]
+        offset = ref_start - ds_start
+        offset_str = f", N-terminal offset: {offset:+d}" if offset != 0 else ""
+        seq_summary_lines.append(f"Dataset '{label}': {len(ds_s)} residues | Sequence {ds_preview} ({ident_ref*100:.1f}% match{offset_str})")
+
+seq_summary_text = "\n".join(seq_summary_lines)
+print(seq_summary_text)
+methodology.append(seq_summary_text)
+
 consensus_ref_start = max(m[0] for m in dataset_matches)
 consensus_ref_end = min(m[1] for m in dataset_matches)
 consensus_len = consensus_ref_end - consensus_ref_start
@@ -453,8 +484,8 @@ if consensus_len < 10:
 CANONICAL_ATOM_ORDER = [
     'N', 'CA', 'C', 'O',
     'CB', 'CG', 'CG1', 'CG2', 'OG', 'OG1', 'SG',
-    'CD', 'CD1', 'CD2', 'ND1', 'ND2', 'OD1', 'OD2',
-    'CE', 'CE1', 'CE2', 'CE3', 'NE', 'NE1', 'NE2', 'OE1', 'OE2',
+    'CD', 'CD1', 'CD2', 'ND1', 'ND2', 'OD1', 'OD2', 'SD',
+    'CE', 'CE1', 'CE2', 'CE3', 'NE', 'NE1', 'NE2', 'OE1', 'OE2', 'SE',
     'CZ', 'CZ2', 'CZ3', 'NZ', 'CH2', 'NH1', 'NH2', 'OH', 'OXT'
 ]
 ATOM_ORDER_INDEX = {name: idx for idx, name in enumerate(CANONICAL_ATOM_ORDER)}
@@ -463,11 +494,28 @@ def canonical_atom_sort_key(atom_name):
     clean = atom_name.strip().upper()
     return (ATOM_ORDER_INDEX.get(clean, 999), clean)
 
+def is_heavy_atom(a):
+    aname = a.name.strip().upper()
+    aname_no_digits = aname.lstrip('0123456789')
+    if aname_no_digits.startswith('H'):
+        return False
+    if hasattr(a, 'type') and a.type.strip().upper() == 'H':
+        return False
+    if hasattr(a, 'element') and a.element.strip().upper() == 'H':
+        return False
+    return aname in ATOM_ORDER_INDEX
+
 ds_residues_homologous = []
 for idx, (_, _, _, _, _, prot_res) in enumerate(temp_universes):
     ref_start, _, ds_start, _ = dataset_matches[idx]
     ds_offset_start = ds_start + (consensus_ref_start - ref_start)
-    ds_residues_homologous.append(prot_res[ds_offset_start : ds_offset_start + consensus_len])
+    ds_slice = prot_res[ds_offset_start : ds_offset_start + consensus_len]
+    if len(ds_slice) != consensus_len:
+        raise ValueError(
+            f"Dataset '{temp_universes[idx][2]}' homologous residue slice length ({len(ds_slice)}) "
+            f"does not match expected consensus length ({consensus_len}). Boundary offset: {ds_offset_start}."
+        )
+    ds_residues_homologous.append(ds_slice)
 
 ds_consensus_atom_lists = [[] for _ in range(len(temp_universes))]
 
@@ -475,7 +523,7 @@ for r in range(consensus_len):
     res_atoms_per_ds = []
     for idx in range(len(temp_universes)):
         res_r = ds_residues_homologous[idx][r]
-        heavy_atoms = [a for a in res_r.atoms if not (a.name.strip().upper().startswith('H') or (hasattr(a, 'type') and a.type.strip().upper() == 'H'))]
+        heavy_atoms = [a for a in res_r.atoms if is_heavy_atom(a)]
         name_to_atom = {}
         for a in heavy_atoms:
             aname = a.name.strip().upper()
@@ -496,7 +544,13 @@ for r in range(consensus_len):
 ds_consensus_groups = [mda.AtomGroup(alist) for alist in ds_consensus_atom_lists]
 
 def make_alias(src, dst):
-    if os.path.abspath(src) == os.path.abspath(dst):
+    dst_abs = os.path.abspath(dst)
+    if os.path.abspath(src) == dst_abs:
+        return
+    try:
+        if os.path.commonpath([out_dir, dst_abs]) != out_dir:
+            return
+    except ValueError:
         return
     if os.path.exists(dst) or os.path.islink(dst):
         try:
@@ -519,6 +573,13 @@ for i, atom in enumerate(u_consensus.atoms, start=1):
 
 ref_consensus_pos = ref_atoms.positions.copy()
 ref_consensus_mean = ref_consensus_pos - ref_consensus_pos.mean(axis=0)
+
+ref_rg = float(np.mean(np.sqrt(np.sum(ref_consensus_mean**2, axis=1))))
+if 0 < ref_rg < 5.0:
+    print(f"  -> Auto-detected nanometer (nm) coordinate scale for reference (Rg={ref_rg:.2f} nm). Auto-scaling reference to Ångströms (x10)...")
+    ref_consensus_mean *= 10.0
+    ref_rg *= 10.0
+
 u_consensus.atoms.positions = ref_consensus_mean
 
 merged_ref_path = os.path.join(out_dir, "merged_reference.pdb")
@@ -562,14 +623,14 @@ print(f"  -> Dynamic sequence alignment matched {consensus_len} residues ({len(u
 
 total_frames = sum(len(u_ds.trajectory) for _, _, _, u_ds, _, _ in temp_universes)
 n_consensus_atoms = len(u_consensus.atoms)
-all_consensus_coords = np.empty((total_frames, n_consensus_atoms, 3), dtype=np.float32)
 dataset_tags = []
 frame_universe_map = []
 universes = []
+dataset_scales = []
+dataset_offsets = []
 
 print(f"\n--- Loading and Aligning {len(dataset_configs)} Trajectory Dataset(s) ---")
 curr_frame_offset = 0
-ref_rg = np.mean(np.linalg.norm(ref_consensus_mean, axis=1))
 
 ds_consensus_indexers = [precompute_atom_indexer(ag) for ag in ds_consensus_groups]
 
@@ -577,27 +638,28 @@ for idx, (pdb_p, xtc_p, label, u_ds, ca_g, prot_res) in enumerate(temp_universes
     print(f"Loading dataset '{label}' (PDB: {pdb_p}, XTC: {xtc_p})...")
     universes.append(u_ds)
     n_ds_frames = len(u_ds.trajectory)
-    raw_slice = all_consensus_coords[curr_frame_offset : curr_frame_offset + n_ds_frames]
-    extract_group_coords(u_ds, ds_consensus_indexers[idx], out=raw_slice)
+    dataset_offsets.append(curr_frame_offset)
     
+    # Fast scale detection using first frame
     if n_ds_frames > 0:
-        ca_centered = raw_slice[0] - raw_slice[0].mean(axis=0)
-        ds_rg = np.mean(np.linalg.norm(ca_centered, axis=1))
+        pos0 = u_ds.trajectory[0].positions[ds_consensus_indexers[idx]]
+        ca_centered = pos0 - pos0.mean(axis=0)
+        ds_rg = float(np.mean(np.sqrt(np.sum(ca_centered**2, axis=1))))
         
-        if ref_rg > 5.0 and ds_rg > 0 and ds_rg < 5.0:
-            print(f"  -> Auto-detected nanometer (nm) coordinate scale for dataset '{label}' (Rg={ds_rg:.2f} nm vs ref {ref_rg:.2f} A). Auto-scaling to Angstroms (x10)...")
-            raw_slice *= 10.0
-        elif ref_rg < 5.0 and ds_rg > 5.0:
-            print(f"  -> Auto-detected nanometer (nm) coordinate scale for reference (Rg={ref_rg:.2f} nm). Auto-scaling dataset '{label}' (/10)...")
-            raw_slice /= 10.0
-            
+        if 0 < ds_rg < 5.0:
+            print(f"  -> Auto-detected nanometer (nm) coordinate scale for dataset '{label}' (Rg={ds_rg:.2f} nm). Auto-scaling to Ångströms (x10)...")
+            dataset_scales.append(10.0)
+        else:
+            dataset_scales.append(1.0)
+    else:
+        dataset_scales.append(1.0)
+        
     dataset_tags.extend([label] * n_ds_frames)
     for local_idx in range(n_ds_frames):
         frame_universe_map.append((u_ds, local_idx))
     curr_frame_offset += n_ds_frames
 
-if total_frames > 0:
-    batched_kabsch(all_consensus_coords, ref_consensus_mean, out=all_consensus_coords)
+dataset_offsets.append(curr_frame_offset)
 
 n_frames_initial = total_frames
 print(f"Loaded {n_frames_initial} total conformations across {len(dataset_configs)} dataset(s).")
@@ -614,27 +676,37 @@ if args.skim.lower() == "true" and args.equator and args.top and args.bottom:
     
     print(f"\n--- Starting Tandem Skimming ---")
     
-    skim_indexers = []
-    top_indexers = []
-    bot_indexers = []
-    for u_ds in universes:
-        s_atoms = u_ds.select_atoms(f"resid {res_str} and name CA")
-        t_atom = u_ds.select_atoms(f"resid {top_res} and name CA")
-        b_atom = u_ds.select_atoms(f"resid {bot_res} and name CA")
-        if len(t_atom) == 0 or len(b_atom) == 0:
-            print("Error: Top or Bottom residue CA not found. Aborting skim.")
-            sys.exit(1)
-        skim_indexers.append(precompute_atom_indexer(s_atoms))
-        top_indexers.append(precompute_atom_indexer(t_atom))
-        bot_indexers.append(precompute_atom_indexer(b_atom))
-        
     skim_coords_list = []
     top_coords_list = []
     bot_coords_list = []
     for idx, u_ds in enumerate(universes):
-        s_coords = extract_group_coords(u_ds, skim_indexers[idx])
-        t_coords = extract_group_coords(u_ds, top_indexers[idx])[:, 0, :]
-        b_coords = extract_group_coords(u_ds, bot_indexers[idx])[:, 0, :]
+        s_atom_list = []
+        for r_num in all_skim_res:
+            r_idx = r_num - 1
+            if 0 <= r_idx < len(ds_residues_homologous[idx]):
+                target_res = ds_residues_homologous[idx][r_idx]
+                ca_matches = target_res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
+                if len(ca_matches) > 0:
+                    s_atom_list.append(ca_matches[0])
+                else:
+                    s_atom_list.append(target_res.atoms[0])
+            else:
+                fallback_atoms = u_ds.select_atoms(f"resid {r_num} and name CA")
+                if len(fallback_atoms) > 0:
+                    s_atom_list.append(fallback_atoms[0])
+                else:
+                    print(f"Error: Residue {r_num} CA not found in dataset '{temp_universes[idx][2]}'. Aborting skim.")
+                    sys.exit(1)
+        s_atoms = mda.AtomGroup(s_atom_list)
+        top_idx_in_s = len(eq_res)
+        bot_idx_in_s = len(eq_res) + 1
+        
+        s_coords = extract_group_coords(u_ds, precompute_atom_indexer(s_atoms))
+        if dataset_scales[idx] != 1.0:
+            s_coords *= dataset_scales[idx]
+        t_coords = s_coords[:, top_idx_in_s, :]
+        b_coords = s_coords[:, bot_idx_in_s, :]
+        
         skim_coords_list.append(s_coords)
         top_coords_list.append(t_coords)
         bot_coords_list.append(b_coords)
@@ -698,23 +770,70 @@ else:
 
 dataset_tags = [dataset_tags[i] for i in valid_frames]
 
-# --- Physical Unified Trajectory Export ---
+# --- Physical Unified Trajectory Export & Streaming Alignment ---
 merged_xtc_path = os.path.join(out_dir, "merged_trajectory.xtc")
 unified_xtc_path = os.path.join(out_dir, "unified_trajectory.xtc")
 
 print(f"\n--- Exporting Physical Unified Trajectory ---")
 print(f"Writing {len(valid_frames)} aligned frames ({len(u_consensus.atoms)} atoms per frame) to {merged_xtc_path}...")
+
+coords_array = np.empty((len(valid_frames), len(pca_atom_indices), 3), dtype=np.float32)
+STREAM_CHUNK = 1024
+
 with mda.Writer(merged_xtc_path, n_atoms=u_consensus.atoms.n_atoms) as w:
-    for f_idx in valid_frames:
-        u_consensus.atoms.positions = all_consensus_coords[f_idx]
-        w.write(u_consensus.atoms)
+    for ds_idx, (pdb_p, xtc_p, label, u_ds, _, _) in enumerate(temp_universes):
+        ds_start = dataset_offsets[ds_idx]
+        ds_end = dataset_offsets[ds_idx + 1]
+        ds_valid_mask = (valid_frames >= ds_start) & (valid_frames < ds_end)
+        if not np.any(ds_valid_mask):
+            continue
+        
+        ds_valid_out_indices = np.where(ds_valid_mask)[0]
+        ds_valid_local_frames = valid_frames[ds_valid_mask] - ds_start
+        
+        indexer = ds_consensus_indexers[ds_idx]
+        scale = dataset_scales[ds_idx]
+        
+        chunk_coords = []
+        chunk_dest_idx = []
+        ptr = 0
+        n_needed = len(ds_valid_local_frames)
+        
+        for f_i, ts in enumerate(u_ds.trajectory):
+            if ptr >= n_needed:
+                break
+            if f_i == ds_valid_local_frames[ptr]:
+                chunk_coords.append(ts.positions[indexer])
+                chunk_dest_idx.append(ds_valid_out_indices[ptr])
+                ptr += 1
+                
+                if len(chunk_coords) == STREAM_CHUNK:
+                    c_batch = np.array(chunk_coords, dtype=np.float32)
+                    if scale != 1.0:
+                        c_batch *= scale
+                    batched_kabsch(c_batch, ref_consensus_mean, out=c_batch)
+                    for pos in c_batch:
+                        u_consensus.atoms.positions = pos
+                        w.write(u_consensus.atoms)
+                    coords_array[chunk_dest_idx] = c_batch[:, pca_atom_indices, :]
+                    chunk_coords.clear()
+                    chunk_dest_idx.clear()
+                    
+        if len(chunk_coords) > 0:
+            c_batch = np.array(chunk_coords, dtype=np.float32)
+            if scale != 1.0:
+                c_batch *= scale
+            batched_kabsch(c_batch, ref_consensus_mean, out=c_batch)
+            for pos in c_batch:
+                u_consensus.atoms.positions = pos
+                w.write(u_consensus.atoms)
+            coords_array[chunk_dest_idx] = c_batch[:, pca_atom_indices, :]
+            chunk_coords.clear()
+            chunk_dest_idx.clear()
+
 print(f"  -> Exported merged trajectory to {merged_xtc_path}")
 make_alias(merged_xtc_path, unified_xtc_path)
 print(f"  -> Created unified trajectory alias at {unified_xtc_path}")
-
-# Extract PCA/RMSD coordinates strictly for valid frames, then free full consensus buffer
-coords_array = all_consensus_coords[valid_frames][:, pca_atom_indices, :]
-del all_consensus_coords
 
 # Calculate RMSD to Reference
 diff_ref = coords_array - ref_bb
@@ -790,11 +909,44 @@ if args.allostery.lower() == "true":
         cav_str = " ".join([str(x) for x in cav_res])
         loop_str = " ".join([str(x) for x in loop_res])
         
-        cav_indexers = [precompute_atom_indexer(u_ds.select_atoms(f"resid {cav_str} and name CA")) for u_ds in universes]
-        loop_indexers = [precompute_atom_indexer(u_ds.select_atoms(f"resid {loop_str} and name CA")) for u_ds in universes]
-        
-        cav_coords_list = [extract_group_coords(u_ds, cav_indexers[idx]) for idx, u_ds in enumerate(universes)]
-        loop_coords_list = [extract_group_coords(u_ds, loop_indexers[idx]) for idx, u_ds in enumerate(universes)]
+        cav_indexers = []
+        loop_indexers = []
+        for idx, u_ds in enumerate(universes):
+            c_atoms = []
+            for r_num in cav_res:
+                r_idx = r_num - 1
+                if 0 <= r_idx < len(ds_residues_homologous[idx]):
+                    t_res = ds_residues_homologous[idx][r_idx]
+                    ca_m = t_res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
+                    c_atoms.append(ca_m[0] if len(ca_m) > 0 else t_res.atoms[0])
+                else:
+                    fb = u_ds.select_atoms(f"resid {r_num} and name CA")
+                    if len(fb) > 0:
+                        c_atoms.append(fb[0])
+            l_atoms = []
+            for r_num in loop_res:
+                r_idx = r_num - 1
+                if 0 <= r_idx < len(ds_residues_homologous[idx]):
+                    t_res = ds_residues_homologous[idx][r_idx]
+                    ca_m = t_res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
+                    l_atoms.append(ca_m[0] if len(ca_m) > 0 else t_res.atoms[0])
+                else:
+                    fb = u_ds.select_atoms(f"resid {r_num} and name CA")
+                    if len(fb) > 0:
+                        l_atoms.append(fb[0])
+            cav_indexers.append(precompute_atom_indexer(mda.AtomGroup(c_atoms) if c_atoms else u_ds.atoms[:0]))
+            loop_indexers.append(precompute_atom_indexer(mda.AtomGroup(l_atoms) if l_atoms else u_ds.atoms[:0]))
+
+        cav_coords_list = []
+        loop_coords_list = []
+        for idx, u_ds in enumerate(universes):
+            c_c = extract_group_coords(u_ds, cav_indexers[idx])
+            l_c = extract_group_coords(u_ds, loop_indexers[idx])
+            if dataset_scales[idx] != 1.0:
+                c_c *= dataset_scales[idx]
+                l_c *= dataset_scales[idx]
+            cav_coords_list.append(c_c)
+            loop_coords_list.append(l_c)
             
         cav_coords = np.concatenate(cav_coords_list, axis=0)[valid_frames]
         loop_coords = np.concatenate(loop_coords_list, axis=0)[valid_frames]
@@ -862,11 +1014,17 @@ if args.cluster != "none":
     else:
         N = len(valid_frames)
 
-    def extract_c(pfx, c_idx, cid, out_dir):
-        frame_idx = valid_frames[c_idx]
-        u_curr, local_idx = frame_universe_map[frame_idx]
-        u_curr.trajectory[local_idx]
-        u_curr.atoms.write(f"{out_dir}/{pfx}_centroid_{cid}.pdb")
+    try:
+        u_centroid_src = mda.Universe(merged_ref_path, merged_xtc_path)
+        def extract_c(pfx, c_idx, cid, out_dir):
+            u_centroid_src.trajectory[c_idx]
+            u_centroid_src.atoms.write(f"{out_dir}/{pfx}_centroid_{cid}.pdb")
+    except Exception:
+        def extract_c(pfx, c_idx, cid, out_dir):
+            frame_idx = valid_frames[c_idx]
+            u_curr, local_idx = frame_universe_map[frame_idx]
+            u_curr.trajectory[local_idx]
+            u_curr.atoms.write(f"{out_dir}/{pfx}_centroid_{cid}.pdb")
 
     for m in methods_to_run:
         
@@ -981,9 +1139,9 @@ if args.calc_energy.lower() == "true":
 
         prot_res_str = " ".join(PROTEIN_RESNAMES)
         u_ref_clean = mda.Universe(merged_ref_path)
-        u_heavy = u_ref_clean.select_atoms(f"resname {prot_res_str} and not (name H* or type H)")
+        u_heavy = u_ref_clean.select_atoms(f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)")
         if len(u_heavy) == 0:
-            u_heavy = u_ref_clean.select_atoms("not (name H* or type H or resname WAT or resname HOH or resname SOL or resname NA or resname CL)")
+            u_heavy = u_ref_clean.select_atoms("not (name H* or name [0-9]H* or type H or element H or resname WAT or resname HOH or resname SOL or resname NA or resname CL)")
         
         resnames = list(u_heavy.residues.resnames)
         for i in range(len(resnames)):
@@ -1056,6 +1214,12 @@ if args.calc_energy.lower() == "true":
         ref_modeller.addHydrogens(forcefield)
         system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
         
+        # Freeze heavy atoms so energy minimization exclusively relaxes hydrogens,
+        # preserving authentic sampled conformational backbone and sidechains.
+        for a in ref_modeller.topology.atoms():
+            if a.element.symbol != 'H':
+                system.setParticleMass(a.index, 0.0 * unit.dalton)
+        
         integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
         
         try:
@@ -1117,9 +1281,9 @@ if args.calc_energy.lower() == "true":
         if not use_merged_traj:
             universe_heavy_info = {}
             for u_obj in set(u for u, _ in frame_universe_map):
-                u_h = u_obj.select_atoms(f"resname {prot_res_str} and not (name H* or type H)")
+                u_h = u_obj.select_atoms(f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)")
                 if len(u_h) == 0:
-                    u_h = u_obj.select_atoms("not (name H* or type H or resname WAT or resname HOH or resname SOL or resname NA or resname CL)")
+                    u_h = u_obj.select_atoms("not (name H* or name [0-9]H* or type H or element H or resname WAT or resname HOH or resname SOL or resname NA or resname CL)")
                 h_indexer = precompute_atom_indexer(u_h)
                 if len(u_h) == len(u_heavy):
                     map_idx = None
@@ -1156,10 +1320,11 @@ if args.calc_energy.lower() == "true":
             except Exception:
                 energy_dict = {}
                 
+        relax_steps = args.min_steps if args.min_steps > 0 else 25
         if args.min_steps > 0:
-            print(f"  -> Minimizing and evaluating energy for each valid frame ({args.min_steps} steps per frame)...")
+            print(f"  -> Relaxing hydrogens and evaluating energy ({args.min_steps} steps per frame, heavy atoms frozen)...")
         else:
-            print("  -> Evaluating direct potential energy for each valid frame (0 minimization steps)...")
+            print("  -> Evaluating potential energy with hydrogen clash-relief (25 steps per frame, heavy atoms frozen)...")
 
         try:
             for local_idx, frame_idx in enumerate(tqdm(valid_frames)):
@@ -1198,22 +1363,9 @@ if args.calc_energy.lower() == "true":
                 
                 try:
                     simulation.context.setPositions(current_full_pos * unit.nanometers)
-                    if args.min_steps > 0:
-                        simulation.minimizeEnergy(maxIterations=args.min_steps)
-                        state = simulation.context.getState(getEnergy=True)
-                        energy_val = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
-                    else:
-                        state = simulation.context.getState(getEnergy=True)
-                        energy_val = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
-                        # Adaptive clash-relief fallback: If static hydrogen placement caused an extreme clash (>1e5 kcal/mol or NaN),
-                        # run a micro-minimization (25 steps) to relieve the clash and converge to physical energy
-                        if np.isnan(energy_val) or np.isinf(energy_val) or energy_val > 1e5:
-                            try:
-                                simulation.minimizeEnergy(maxIterations=25)
-                                state = simulation.context.getState(getEnergy=True)
-                                energy_val = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
-                            except Exception:
-                                pass
+                    simulation.minimizeEnergy(maxIterations=relax_steps)
+                    state = simulation.context.getState(getEnergy=True)
+                    energy_val = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
 
                     if np.isnan(energy_val) or np.isinf(energy_val):
                         energy_val = np.nan
@@ -1379,6 +1531,7 @@ html_content = """<!DOCTYPE html>
         <button class="close-btn" onclick="closeModal()">Close</button>
     </div>
     <script>
+        const EMBEDDED_METRICS_JSON = /*EMBEDDED_DATA_PLACEHOLDER*/[];
         let globalData = [];
         let globalLoadings = [];
         let cols = [];
@@ -1400,6 +1553,13 @@ html_content = """<!DOCTYPE html>
         });
 
         window.addEventListener('DOMContentLoaded', () => {
+            if (Array.isArray(EMBEDDED_METRICS_JSON) && EMBEDDED_METRICS_JSON.length > 0) {
+                globalData = EMBEDDED_METRICS_JSON;
+                cols = Object.keys(globalData[0]);
+                populateDropdowns();
+                updatePlots();
+                return;
+            }
             fetch('global_cluster_metrics.csv')
                 .then(r => { if (r.ok) return r.text(); throw new Error('Not found'); })
                 .then(text => {
@@ -1851,7 +2011,7 @@ html_content = """<!DOCTYPE html>
             }
             
             if(cols.includes('OpenMM_Energy_kcal_mol')) {
-                const e_vals = globalData.map(d => Number(d['OpenMM_Energy_kcal_mol'])).filter(v => v !== null && v !== undefined && !isNaN(v));
+                const e_vals = plotData.map(d => Number(d['OpenMM_Energy_kcal_mol'])).filter(v => v !== null && v !== undefined && !isNaN(v));
                 if (e_vals.length > 0) {
                     document.getElementById('timeseries-plot').innerHTML = '';
                     document.getElementById('hist-plot').innerHTML = '';
@@ -1860,7 +2020,7 @@ html_content = """<!DOCTYPE html>
                     const q3 = sorted_e[Math.floor(sorted_e.length * 0.75)];
                     const iqr = q3 - q1;
                     const e_filt = (iqr > 0) ? e_vals.filter(v => v >= q1 - 2*iqr && v <= q3 + 2*iqr) : e_vals;
-                    Plotly.react('timeseries-plot', [{ x: frames, y: globalData.map(d => d['OpenMM_Energy_kcal_mol']), type: 'scatter', mode: 'lines', line: {color: '#d4af37'} }], { title: {text: 'Energy Progression', font: {family: 'Playfair Display', color: '#1b3a30'}}, xaxis: {title: 'Frame Index'}, yaxis: {title: 'Energy (kcal/mol)'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
+                    Plotly.react('timeseries-plot', [{ x: frames, y: plotData.map(d => d['OpenMM_Energy_kcal_mol']), type: 'scatter', mode: 'lines', line: {color: '#d4af37'} }], { title: {text: 'Energy Progression', font: {family: 'Playfair Display', color: '#1b3a30'}}, xaxis: {title: 'Frame Index'}, yaxis: {title: 'Energy (kcal/mol)'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
                     Plotly.react('hist-plot', [{ x: e_filt, type: 'histogram', marker: {color: '#0f251e'} }], { title: {text: 'Energy Distribution (Representative Subset)', font: {family: 'Playfair Display', color: '#1b3a30'}}, xaxis: {title: 'Energy (kcal/mol)'}, yaxis: {title: 'Frequency'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
                 }
             }
@@ -1870,37 +2030,31 @@ html_content = """<!DOCTYPE html>
 </body>
 </html>"""
 
-if is_only_energy:
-    df.to_csv(f"{out_dir}/global_cluster_metrics.csv", index=False)
-    print(f"Saved complete energy metrics to {out_dir}/global_cluster_metrics.csv")
-    
-    with open(f"{out_dir}/metflow_dashboard.html", "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"🌟 Generated interactive Dashboard: {out_dir}/metflow_dashboard.html")
-
-    with open(f"{out_dir}/methodology.txt", "w") as f:
-        f.write("\n".join(methodology) + "\n")
-    print("Saved methodology.txt")
-    print("==================================================")
-    print(" ✅ Option [C] Energy ONLY Evaluation Complete!")
-    print("==================================================")
-    sys.exit(0)
-
 try:
     df.rename(columns={"PCA_1": f"PCA_1 ({var_explained[0]:.1f}%)", "PCA_2": f"PCA_2 ({var_explained[1]:.1f}%)", "PCA_3": f"PCA_3 ({var_explained[2]:.1f}%)"}, inplace=True)
 except Exception:
     pass
+
+df_json = df.to_json(orient="records")
+html_final = html_content.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
+
 df.to_csv(f"{out_dir}/global_cluster_metrics.csv", index=False)
 print(f"Saved complete metrics to {out_dir}/global_cluster_metrics.csv")
 
 with open(f"{out_dir}/metflow_dashboard.html", "w", encoding="utf-8") as f:
-    f.write(html_content)
-print(f"🌟 Generated interactive Dashboard (Copy to your laptop!): {out_dir}/metflow_dashboard.html")
+    f.write(html_final)
+print(f"🌟 Generated interactive Dashboard (with embedded data for zero-CORS offline browsing!): {out_dir}/metflow_dashboard.html")
 
 # Generate PCA Dataset Origin Comparison Plot
 plt.figure(figsize=(10, 8))
 unique_datasets = list(pd.unique(df["Dataset"]))
-palette = sns.color_palette("Set1", max(1, len(unique_datasets)))
+n_ds = len(unique_datasets)
+if n_ds <= 10:
+    palette = sns.color_palette("tab10", n_ds)
+elif n_ds <= 20:
+    palette = sns.color_palette("tab20", n_ds)
+else:
+    palette = sns.color_palette("husl", n_ds)
 
 pc1_col_name = [c for c in df.columns if c.startswith("PCA_1")][0]
 pc2_col_name = [c for c in df.columns if c.startswith("PCA_2")][0]
@@ -1916,6 +2070,72 @@ plt.ylabel(pc2_col_name)
 plt.savefig(f"{out_dir}/pca_dataset_comparison.png", dpi=300, bbox_inches="tight")
 plt.close()
 print(f"Saved PCA Dataset Comparison Plot to {out_dir}/pca_dataset_comparison.png")
+
+# Generate Energy Landscape Plot
+if "OpenMM_Energy_kcal_mol" in df.columns:
+    plt.figure(figsize=(10, 8))
+    en = df["OpenMM_Energy_kcal_mol"].dropna()
+    if len(en) > 0:
+        vmax = np.percentile(en, 95)
+        vmin = np.min(en)
+        scatter = plt.scatter(df[pc1_col_name], df[pc2_col_name], c=df["OpenMM_Energy_kcal_mol"], cmap="coolwarm", alpha=0.7, s=15, vmin=vmin, vmax=vmax)
+        plt.colorbar(scatter, label="Energy (kcal/mol)")
+        plt.title("Free Energy Landscape (PCA colored by OpenMM Energy)")
+        plt.xlabel(pc1_col_name)
+        plt.ylabel(pc2_col_name)
+        plt.savefig(f"{out_dir}/energy_landscape_plot.png", dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"Saved Energy Landscape Plot to {out_dir}/energy_landscape_plot.png")
+
+# Generate PCA 1D Distributions partitioned by origin dataset
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+if n_ds <= 10:
+    dist_palette = sns.color_palette("tab10", n_ds)
+elif n_ds <= 20:
+    dist_palette = sns.color_palette("tab20", n_ds)
+else:
+    dist_palette = sns.color_palette("husl", n_ds)
+
+for i, ds in enumerate(unique_datasets):
+    sub = df[df["Dataset"] == ds]
+    color = dist_palette[i % len(dist_palette)]
+    lbl = f"{ds} (n={len(sub)})"
+    if len(sub) > 1:
+        try:
+            sns.kdeplot(data=sub[pc1_col_name], ax=ax1, label=lbl, color=color, fill=True, alpha=0.25, warn_singular=False)
+            sns.kdeplot(data=sub[pc2_col_name], ax=ax2, label=lbl, color=color, fill=True, alpha=0.25, warn_singular=False)
+        except Exception:
+            ax1.hist(sub[pc1_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+            ax2.hist(sub[pc2_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+    else:
+        ax1.hist(sub[pc1_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+        ax2.hist(sub[pc2_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+
+ax1.set_title("Conformational Density along PC1 by Dataset")
+ax1.set_xlabel(pc1_col_name)
+ax1.set_ylabel("Density")
+ax1.legend(title="Dataset")
+ax1.grid(True, alpha=0.3)
+
+ax2.set_title("Conformational Density along PC2 by Dataset")
+ax2.set_xlabel(pc2_col_name)
+ax2.set_ylabel("Density")
+ax2.legend(title="Dataset")
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f'{out_dir}/pca_1d_distributions.png', dpi=300, bbox_inches='tight')
+plt.close()
+print(f"Saved PCA 1D Distributions to {out_dir}/pca_1d_distributions.png")
+
+if is_only_energy:
+    with open(f"{out_dir}/methodology.txt", "w") as f:
+        f.write("\n".join(methodology) + "\n")
+    print("Saved methodology.txt")
+    print("==================================================")
+    print(" ✅ Option [C] Energy ONLY Evaluation Complete!")
+    print("==================================================")
+    sys.exit(0)
 
 # Generate dataset cluster summary text file
 summary_lines = ["=== Multi-Trajectory Dataset Cluster Distribution Summary ===", f"Total Datasets: {len(unique_datasets)}", f"Total Frames: {len(df)}\n"]
@@ -2057,34 +2277,7 @@ plt.close()
 print(f"Saved PCA Loadings Plot to {out_dir}/pca_loadings_plot.png")
 
 # Generate Energy Landscape Plot
-if "OpenMM_Energy_kcal_mol" in df.columns:
-    plt.figure(figsize=(10, 8))
-    
-    en = df["OpenMM_Energy_kcal_mol"]
-    vmax = np.percentile(en, 95)
-    vmin = np.min(en)
-    
-    scatter = plt.scatter(df[f"PCA_1 ({var_explained[0]:.1f}%)"], df[f"PCA_2 ({var_explained[1]:.1f}%)"], c=en, cmap="coolwarm", alpha=0.7, s=15, vmin=vmin, vmax=vmax)
-    plt.colorbar(scatter, label="Energy (kcal/mol)")
-    plt.title("Free Energy Landscape (PCA colored by OpenMM Energy)")
-    plt.xlabel(f"Principal Component 1 ({var_explained[0]:.1f}%)")
-    plt.ylabel(f"Principal Component 2 ({var_explained[1]:.1f}%)")
-    plt.savefig(f"{out_dir}/energy_landscape_plot.png", dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"Saved Energy Landscape Plot to {out_dir}/energy_landscape_plot.png")
 
-# Generate PCA 1D Distribution (Frequency vs PC Value)
-plt.figure(figsize=(10, 6))
-plt.hist(df[f"PCA_1 ({var_explained[0]:.1f}%)"], bins=50, density=True, alpha=0.5, color="blue", label="PC1 Score")
-plt.hist(df[f"PCA_2 ({var_explained[1]:.1f}%)"], bins=50, density=True, alpha=0.5, color="orange", label="PC2 Score")
-plt.xlabel("Principal Component Score")
-plt.ylabel("Frequency (Density)")
-plt.title("1D Distribution of Principal Component Scores")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.savefig(f'{out_dir}/pca_1d_distributions.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"Saved PCA 1D Distributions to {out_dir}/pca_1d_distributions.png")
 
 with open(f"{out_dir}/methodology.txt", "w") as f:
     f.write("\n".join(methodology) + "\n")
