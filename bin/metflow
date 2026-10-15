@@ -1,0 +1,576 @@
+#!/bin/bash
+set -e
+
+SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || readlink -f "$BASH_SOURCE")
+BIN_DIR=$(dirname "$SCRIPT_PATH")
+INSTALL_DIR=$(dirname "$BIN_DIR")
+MAMBA_BIN=$(command -v micromamba || echo "$HOME/.local/bin/micromamba")
+
+eval "$("$MAMBA_BIN" shell hook --shell=bash)"
+micromamba activate conf_sel_gen
+
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export TF_FORCE_GPU_ALLOW_GROWTH=true
+export JAX_PLATFORMS=cpu
+
+LOG_FILE="metflow_run.log"
+OUTPUT_DIR="./bioemu_ensemble"
+STATUS_FILE=".metflow_status"
+
+run_analysis() {
+    echo "================================================="
+    echo "   MET Pipeline Analysis & Clustering Menu"
+    echo "================================================="
+    
+    PARAM_FILE="metflow_params.txt"
+    LOAD_PREV=false
+
+    if [ "$2" == "true" ]; then
+        OUT_DIR_VAL="${CUSTOM_OUT:-clustering_results}"
+        CMD_ARGS=(--only_dashboard "true" --out_dir "$OUT_DIR_VAL")
+        mkdir -p "$OUT_DIR_VAL"
+        PARAM_CONTENT="max_frames=0
+skim=false
+cluster=none
+calc_energy=false
+min_steps=0
+allostery=false
+pca_ref=combined
+pdb=${CUSTOM_PDB:-}
+xtc=${CUSTOM_XTC:-}
+labels=${CUSTOM_LABELS:-}
+out_dir=${OUT_DIR_VAL}
+multi_datasets=${IS_MULTI_DATASET:-false}
+only_energy=false
+only_dashboard=true"
+        echo "$PARAM_CONTENT" > "$PARAM_FILE"
+        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/$PARAM_FILE"
+
+        TARGET_SCRIPT="$INSTALL_DIR/analyze_trajectory.py"
+        if [ -f "./analyze_trajectory.py" ]; then
+            TARGET_SCRIPT="./analyze_trajectory.py"
+        elif [ -f "$BIN_DIR/analyze_trajectory.py" ]; then
+            TARGET_SCRIPT="$BIN_DIR/analyze_trajectory.py"
+        fi
+
+        micromamba run -n conf_sel_analysis python "$TARGET_SCRIPT" "${CMD_ARGS[@]}"
+        exit 0
+    fi
+
+    if [ "$1" != "true" ] && [ "$2" != "true" ] && [ -f "$PARAM_FILE" ]; then
+        echo "⚠️ Found existing parameter file: $PARAM_FILE"
+        echo "  [1] Start New Analysis (Interactive Prompt) [DEFAULT]"
+        echo "  [2] Load Previous Parameters (from $PARAM_FILE)"
+        read -r -p "Selection [1-2] (Default: 1): " param_choice
+        if [[ "$param_choice" == "2" ]]; then
+            LOAD_PREV=true
+            echo "Loading previous parameters from $PARAM_FILE..."
+        fi
+    fi
+
+    if [ "$LOAD_PREV" = true ]; then
+        CMD_ARGS=()
+        while IFS='=' read -r key val || [ -n "$key" ]; do
+            # Fast zero-copy bash string manipulation
+            key="${key%$'\r'}"
+            val="${val%$'\r'}"
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="${val%"${val##*[![:space:]]}"}"
+            case "$key" in
+                ''|\#*) continue ;;
+                max_frames) [ -n "$val" ] && [ "$val" != "0" ] && CMD_ARGS+=(--max_frames "$val") ;;
+                skim) [ "$val" == "true" ] && CMD_ARGS+=(--skim "true" --equator "11, 41, 67, 102, 129, 155" --top "126" --bottom "166") ;;
+                cluster) [ -n "$val" ] && CMD_ARGS+=(--cluster "$val") ;;
+                calc_energy) [ "$val" == "true" ] && CMD_ARGS+=(--calc_energy "true") ;;
+                min_steps) [ -n "$val" ] && CMD_ARGS+=(--min_steps "$val") ;;
+                allostery) [ "$val" == "true" ] && CMD_ARGS+=(--allostery "true" --advanced_plots "true") ;;
+                pca_ref) [ -n "$val" ] && CMD_ARGS+=(--pca_ref "$val") ;;
+                pdb) [ -n "$val" ] && CMD_ARGS+=(--pdb "$val") ;;
+                xtc) [ -n "$val" ] && CMD_ARGS+=(--xtc "$val") ;;
+                labels|dataset_labels) [ -n "$val" ] && CMD_ARGS+=(--dataset_labels "$val") ;;
+                out_dir) [ -n "$val" ] && CMD_ARGS+=(--out_dir "$val"); OUT_DIR_VAL="$val" ;;
+                multi_datasets) [ "$val" == "true" ] && CMD_ARGS+=(--multi_datasets "$val") ;;
+                only_energy) [ "$val" == "true" ] && CMD_ARGS+=(--only_energy "true") ;;
+                only_dashboard) [ "$val" == "true" ] && CMD_ARGS+=(--only_dashboard "true") ;;
+            esac
+        done < "$PARAM_FILE"
+    elif [ "$1" == "true" ]; then
+        echo ""
+        echo "[Downsampling] Processing thousands of frames takes a long time."
+        read -r -p "Max frames per dataset (e.g. 1000) or leave blank for ALL: " max_frames_input
+
+        echo ""
+        read -r -p "OpenMM minimization steps per frame (Default: 0): " min_steps_input
+        MIN_STEPS="${min_steps_input:-0}"
+
+        CLUSTER_OPT="none"
+        SKIM_VAL="false"
+        ALLOSTERY_VAL="false"
+        PCA_REF_VAL="combined"
+        CALC_ENERGY_VAL="true"
+        ONLY_ENERGY_VAL="true"
+        ONLY_DASHBOARD_VAL="false"
+
+        CMD_ARGS=(--calc_energy "true" --only_energy "true" --cluster "none" --min_steps "$MIN_STEPS")
+        if [ -n "$max_frames_input" ]; then
+            CMD_ARGS+=(--max_frames "$max_frames_input")
+        fi
+        if [ -n "$CUSTOM_PDB" ]; then
+            CMD_ARGS+=(--pdb "$CUSTOM_PDB")
+        fi
+        if [ -n "$CUSTOM_XTC" ]; then
+            CMD_ARGS+=(--xtc "$CUSTOM_XTC")
+        fi
+        if [ -n "$CUSTOM_LABELS" ]; then
+            CMD_ARGS+=(--dataset_labels "$CUSTOM_LABELS")
+        fi
+        OUT_DIR_VAL="${CUSTOM_OUT:-energy_results}"
+        CMD_ARGS+=(--out_dir "$OUT_DIR_VAL")
+        if [ -n "$IS_MULTI_DATASET" ]; then
+            CMD_ARGS+=(--multi_datasets "$IS_MULTI_DATASET")
+        fi
+
+        mkdir -p "$OUT_DIR_VAL"
+        PARAM_CONTENT="max_frames=${max_frames_input:-0}
+skim=${SKIM_VAL}
+cluster=${CLUSTER_OPT}
+calc_energy=${CALC_ENERGY_VAL}
+min_steps=${MIN_STEPS}
+allostery=${ALLOSTERY_VAL}
+pca_ref=${PCA_REF_VAL}
+pdb=${CUSTOM_PDB:-}
+xtc=${CUSTOM_XTC:-}
+labels=${CUSTOM_LABELS:-}
+out_dir=${OUT_DIR_VAL}
+multi_datasets=${IS_MULTI_DATASET:-false}
+only_energy=${ONLY_ENERGY_VAL}
+only_dashboard=${ONLY_DASHBOARD_VAL}"
+        echo "$PARAM_CONTENT" > "$PARAM_FILE"
+        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/$PARAM_FILE"
+    else
+        echo ""
+        echo "[Downsampling] Processing thousands of frames takes a long time."
+        read -r -p "Max frames per dataset (e.g. 1000) or leave blank for ALL: " max_frames_input
+        
+        echo ""
+        echo "[1] Skim based on 6 inner-barrel residues"
+        echo "[2] No skimming, cluster everything"
+        read -r -p "Selection [1-2] (Default: 2): " skim_choice
+        
+        echo ""
+        echo "Select Clustering Algorithm:"
+        echo "  [1] PCA + K-Means (Fast, geometric clustering in PC space) [DEFAULT]"
+        echo "  [2] Daura / GROMOS RMSD Clustering (Biophysical, RMSD cutoff based)"
+        echo "  [3] Common Nearest Neighbor (CNN) Density Clustering"
+        echo "  [4] Compare All 3 Clustering Algorithms"
+        read -r -p "Clustering Algorithm [1-4] (Default: 1): " cluster_choice
+
+        echo ""
+        read -r -p "Enable Advanced Options (Allostery/OpenMM Energy/t-SNE/Heatmaps)? [y/N]: " adv_choice
+
+        MIN_STEPS="100"
+        CALC_ENERGY_VAL="false"
+        if [[ "$adv_choice" =~ ^[Yy]$ ]]; then
+            CALC_ENERGY_VAL="true"
+            read -r -p "OpenMM minimization steps per frame (Default: 100): " min_steps_input
+            MIN_STEPS="${min_steps_input:-100}"
+        fi
+
+        echo ""
+        echo "PCA Projection Space:"
+        echo "  [1] Combined PCA Space (Global variance across datasets) [DEFAULT]"
+        echo "  [2] Reference PCA Space (Fit on Dataset 1 'bioemu', project all into it)"
+        read -r -p "Selection [1-2] (Default: 1): " pca_ref_choice
+
+        case $cluster_choice in
+            2) CLUSTER_OPT="daura" ;;
+            3) CLUSTER_OPT="cnn" ;;
+            4) CLUSTER_OPT="all" ;;
+            *) CLUSTER_OPT="pca_kmeans" ;;
+        esac
+
+        CMD_ARGS=(--cluster "$CLUSTER_OPT")
+        if [ -n "$max_frames_input" ]; then
+            CMD_ARGS+=(--max_frames "$max_frames_input")
+        fi
+        SKIM_VAL="false"
+        if [[ "$skim_choice" == "1" ]]; then
+            SKIM_VAL="true"
+            CMD_ARGS+=(--skim "true" --equator "11, 41, 67, 102, 129, 155" --top "126" --bottom "166")
+        fi
+        ALLOSTERY_VAL="false"
+        if [[ "$adv_choice" =~ ^[Yy]$ ]]; then
+            ALLOSTERY_VAL="true"
+            CMD_ARGS+=(--calc_energy "true" --allostery "true" --advanced_plots "true" --min_steps "$MIN_STEPS")
+        fi
+        PCA_REF_VAL="combined"
+        if [[ "$pca_ref_choice" == "2" ]]; then
+            PCA_REF_VAL="first"
+            CMD_ARGS+=(--pca_ref "first")
+        fi
+
+        if [ -n "$CUSTOM_PDB" ]; then
+            CMD_ARGS+=(--pdb "$CUSTOM_PDB")
+        fi
+        if [ -n "$CUSTOM_XTC" ]; then
+            CMD_ARGS+=(--xtc "$CUSTOM_XTC")
+        fi
+        if [ -n "$CUSTOM_LABELS" ]; then
+            CMD_ARGS+=(--dataset_labels "$CUSTOM_LABELS")
+        fi
+        OUT_DIR_VAL="${CUSTOM_OUT:-clustering_results}"
+        CMD_ARGS+=(--out_dir "$OUT_DIR_VAL")
+        if [ -n "$IS_MULTI_DATASET" ]; then
+            CMD_ARGS+=(--multi_datasets "$IS_MULTI_DATASET")
+        fi
+
+        ONLY_ENERGY_VAL="false"
+        ONLY_DASHBOARD_VAL="false"
+
+        mkdir -p "$OUT_DIR_VAL"
+        PARAM_CONTENT="max_frames=${max_frames_input:-0}
+skim=${SKIM_VAL}
+cluster=${CLUSTER_OPT}
+calc_energy=${CALC_ENERGY_VAL}
+min_steps=${MIN_STEPS}
+allostery=${ALLOSTERY_VAL}
+pca_ref=${PCA_REF_VAL}
+pdb=${CUSTOM_PDB:-}
+xtc=${CUSTOM_XTC:-}
+labels=${CUSTOM_LABELS:-}
+out_dir=${OUT_DIR_VAL}
+multi_datasets=${IS_MULTI_DATASET:-false}
+only_energy=${ONLY_ENERGY_VAL}
+only_dashboard=${ONLY_DASHBOARD_VAL}"
+        echo "$PARAM_CONTENT" > "$PARAM_FILE"
+        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/$PARAM_FILE"
+    fi
+
+    TARGET_SCRIPT="$INSTALL_DIR/analyze_trajectory.py"
+    if [ -f "./analyze_trajectory.py" ]; then
+        TARGET_SCRIPT="./analyze_trajectory.py"
+    elif [ -f "$BIN_DIR/analyze_trajectory.py" ]; then
+        TARGET_SCRIPT="$BIN_DIR/analyze_trajectory.py"
+    fi
+
+    echo ""
+    read -r -p "Run analysis in the BACKGROUND (nohup ... &)? [y/N]: " bg_run_choice
+    if [[ "$bg_run_choice" =~ ^[Yy]$ ]]; then
+        LOG_OUT="metflow_analysis.log"
+        nohup micromamba run -n conf_sel_analysis python "$TARGET_SCRIPT" "${CMD_ARGS[@]}" < /dev/null > "$LOG_OUT" 2>&1 &
+        BG_PID=$!
+        disown $BG_PID 2>/dev/null || true
+        echo "🚀 Analysis running in background (PID: $BG_PID)."
+        echo "📋 Log file: $LOG_OUT (Monitor with: tail -f $LOG_OUT)"
+        exit 0
+    else
+        micromamba run -n conf_sel_analysis python "$TARGET_SCRIPT" "${CMD_ARGS[@]}"
+        exit 0
+    fi
+}
+
+RUNNING_PID=$(pgrep -f "run_pipeline.py|bioemu.sample" | head -n 1)
+DO_ANALYSIS=false
+
+if [ -f "$STATUS_FILE" ]; then
+    RUNNING_PID=$(grep "PID=" "$STATUS_FILE" | cut -d'=' -f2)
+    TARGET_SAMPLES=$(grep "TARGET_SAMPLES=" "$STATUS_FILE" | cut -d'=' -f2)
+    
+    if [ -n "$RUNNING_PID" ] && kill -0 "$RUNNING_PID" 2>/dev/null; then
+        COMPLETED_SAMPLES=0
+        if [ -d "$OUTPUT_DIR" ]; then
+            COMPLETED_SAMPLES=$(ls -1q "$OUTPUT_DIR"/*.pdb 2>/dev/null | wc -l)
+        fi
+        
+        PERCENTAGE=0
+        if [ "$TARGET_SAMPLES" -gt 0 ]; then
+            PERCENTAGE=$(( 100 * COMPLETED_SAMPLES / TARGET_SAMPLES ))
+        fi
+        
+        echo "================================================="
+        echo "⚠️  MET Pipeline is currently active in the background! (PID: $RUNNING_PID)"
+        echo "📊 Progress: $COMPLETED_SAMPLES / $TARGET_SAMPLES samples generated ($PERCENTAGE% complete)"
+        echo "================================================="
+        echo "[1] Leave it running"
+        echo "[2] Pause (Freeze) the run"
+        echo "[3] Resume (Unfreeze) the run"
+        echo "[4] Kill it (Stop permanently)"
+        echo "[5] Analyze results (Skip to analysis menu)"
+        read -p "Select an option [1-5]: " bg_choice
+        case $bg_choice in
+            2) kill -STOP $RUNNING_PID; echo "❄️  Paused!"; exit 0 ;;
+            3) kill -CONT $RUNNING_PID; echo "🔥 Resumed!"; exit 0 ;;
+            4) kill -9 $RUNNING_PID; rm -f "$STATUS_FILE"; echo "💀 Killed." ;;
+            5) DO_ANALYSIS=true ;;
+            *) echo "Check progress with: tail -f $LOG_FILE"; exit 0 ;;
+        esac
+    else
+        rm -f "$STATUS_FILE"
+    fi
+elif [ -n "$RUNNING_PID" ]; then
+    echo "================================================="
+    echo "⚠️  MET Pipeline is currently active in the background! (PID: $RUNNING_PID)"
+    echo "================================================="
+    echo "[1] Leave it running"
+    echo "[2] Pause (Freeze) the run"
+    echo "[3] Resume (Unfreeze) the run"
+    echo "[4] Kill it (Stop permanently)"
+    echo "[5] Analyze results (Skip to analysis menu)"
+    read -p "Select an option [1-5]: " bg_choice
+    case $bg_choice in
+        2) kill -STOP $RUNNING_PID; echo "❄️  Paused!"; exit 0 ;;
+        3) kill -CONT $RUNNING_PID; echo "🔥 Resumed!"; exit 0 ;;
+        4) kill -9 $RUNNING_PID; rm -f "$STATUS_FILE"; echo "💀 Killed." ;;
+        5) DO_ANALYSIS=true ;;
+        *) echo "Check progress with: tail -f $LOG_FILE"; exit 0 ;;
+    esac
+fi
+
+if [ "$DO_ANALYSIS" = true ]; then
+    run_analysis
+fi
+
+if [ -f "$OUTPUT_DIR/samples.xtc" ] || [ -f "samples.xtc" ]; then
+    echo "✅ Detected completed trajectory (samples.xtc)!"
+    read -p "Proceed to analysis and clustering? [Y/n]: " proceed_ans
+    if [[ "$proceed_ans" =~ ^[Yy]$ || -z "$proceed_ans" ]]; then
+        run_analysis
+    fi
+fi
+
+NUM_SAMPLES=2000; DENOISING_STEPS=50; DENOISER_SOLVER="dpm"
+while true; do
+    echo "================================================="
+    echo "   MET Pipeline Launch Configuration (v2.7 MERGED)"
+    echo "================================================="
+    echo "-------------------------------------------------"
+    echo "  [P] Change parameters (Current: $NUM_SAMPLES samples, $DENOISING_STEPS steps, $DENOISER_SOLVER solver)"
+    echo "  [S] Start run with Resource Configurator"
+    echo "  [A] Analyze completed BioEmu results"
+    echo "  [E] Analyze external trajectory (XTC/PDB)"
+    echo "  [C] Calculate Thermodynamic Energy ONLY (OpenMM)"
+    echo "  [D] Generate Dashboard HTML ONLY"
+    echo "  [Q] Quit"
+    read -p "Option: " main_choice
+    
+    case $main_choice in
+        [Pp])
+            echo ""
+            echo "Enter the number [1-3] of the parameter you want to change: "
+            echo "  [1] Number of samples (Current: $NUM_SAMPLES)"
+            echo "  [2] Denoising steps (Current: $DENOISING_STEPS)"
+            echo "  [3] Denoiser solver (Current: $DENOISER_SOLVER)"
+            read -p "Parameter index: " param_idx
+            case $param_idx in
+                1)
+                    read -p "Value (Default: 2000): " input_val
+                    if [ -n "$input_val" ]; then NUM_SAMPLES=$input_val; fi
+                    ;;
+                2)
+                    read -p "Value (Default: 50): " input_val
+                    if [ -n "$input_val" ]; then DENOISING_STEPS=$input_val; fi
+                    ;;
+                3)
+                    read -p "Value (dpm/euler): " input_val
+                    if [ "$input_val" == "dpm" ] || [ "$input_val" == "euler" ]; then DENOISER_SOLVER=$input_val; fi
+                    ;;
+            esac
+            ;;
+        [Aa])
+            unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS CUSTOM_OUT IS_MULTI_DATASET
+            echo -e "\n--- Option [A]: Analyze BioEmu Results ---"
+            echo "Select Master Reference Topology PDB for BioEmu analysis:"
+            echo "  [1] ./bioemu_ensemble/topology.pdb [DEFAULT]"
+            echo "  [2] Custom PDB file in working directory..."
+            read -p "Selection [1-2] (Default: 1): " bioemu_pdb_choice
+            if [[ "$bioemu_pdb_choice" == "2" ]]; then
+                read -p "Enter path to Custom Reference PDB file: " CUSTOM_PDB
+            else
+                CUSTOM_PDB="./bioemu_ensemble/topology.pdb"
+            fi
+            run_analysis
+            ;;
+        [Cc])
+            unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS CUSTOM_OUT IS_MULTI_DATASET
+            echo -e "\n--- Option [C]: Calculate Energy ONLY ---"
+            echo "  [1] Single Trajectory Dataset (Default: topology.pdb & samples.xtc)"
+            echo "  [2] Multi-Trajectory Comparative Analysis (2+ Datasets)"
+            echo "  [3] Auto-Detect Matching Datasets in Directory (PDB & XTC with identical stems)"
+            read -p "Selection [1-3] (Default: 1): " c_mode
+
+            if [[ "$c_mode" == "3" ]]; then
+                PDB_ARRAY=(); XTC_ARRAY=(); LABEL_ARRAY=()
+                orig_nullglob=$(shopt -p nullglob || true)
+                shopt -s nullglob
+                for pdb_file in *.pdb; do
+                    stem="${pdb_file%.pdb}"
+                    xtc_file="${stem}.xtc"
+                    if [[ -f "$xtc_file" ]]; then
+                        PDB_ARRAY+=("$pdb_file")
+                        XTC_ARRAY+=("$xtc_file")
+                        LABEL_ARRAY+=("$stem")
+                    fi
+                done
+                eval "$orig_nullglob"
+                if [ ${#PDB_ARRAY[@]} -eq 0 ]; then
+                    echo "❌ No matching PDB and XTC pairs found with identical stems."
+                    exit 1
+                fi
+                echo "✅ Auto-detected ${#PDB_ARRAY[@]} matching dataset pair(s)."
+                read -p "Output folder name [Default: auto_detected_results]: " out_dir_in
+                CUSTOM_OUT="${out_dir_in:-auto_detected_results}"
+                CUSTOM_PDB=$(IFS=,; echo "${PDB_ARRAY[*]}")
+                CUSTOM_XTC=$(IFS=,; echo "${XTC_ARRAY[*]}")
+                CUSTOM_LABELS=$(IFS=,; echo "${LABEL_ARRAY[*]}")
+                IS_MULTI_DATASET="true"
+            elif [[ "$c_mode" == "2" ]]; then
+                read -p "Number of datasets to calculate energy for: " num_ds
+                num_ds="${num_ds:-2}"
+                PDB_ARRAY=(); XTC_ARRAY=(); LABEL_ARRAY=()
+                for ((i=1; i<=num_ds; i++)); do
+                    echo -e "\n--- Dataset $i ---"
+                    read -p "  PDB File Path: " pdb_i
+                    read -p "  XTC File Path: " xtc_i
+                    read -p "  Dataset Label: " label_i
+                    PDB_ARRAY+=("$pdb_i")
+                    XTC_ARRAY+=("$xtc_i")
+                    LABEL_ARRAY+=("${label_i:-Dataset_$i}")
+                done
+                read -p "Output folder name [Default: energy_results]: " out_dir_in
+                CUSTOM_OUT="${out_dir_in:-energy_results}"
+                CUSTOM_PDB=$(IFS=,; echo "${PDB_ARRAY[*]}")
+                CUSTOM_XTC=$(IFS=,; echo "${XTC_ARRAY[*]}")
+                CUSTOM_LABELS=$(IFS=,; echo "${LABEL_ARRAY[*]}")
+                IS_MULTI_DATASET="true"
+            fi
+            run_analysis "true"
+            ;;
+        [Dd]) unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS CUSTOM_OUT IS_MULTI_DATASET; run_analysis "false" "true" ;;
+        [Ee])
+            echo -e "\n--- Analyze External Trajectory ---"
+            echo "[1] Single Trajectory Dataset"
+            echo "[2] Multi-Trajectory Comparative Analysis (2+ Datasets)"
+            echo "[3] Auto-Detect Matching Datasets in Directory (PDB & XTC sharing same prefix/stem)"
+            echo "(Note: PDB and XTC pairs must share the same filename stem to be auto-detected)"
+            read -p "Selection [1-3] (Default: 1): " ext_mode
+            
+            if [[ "$ext_mode" == "3" ]]; then
+                PDB_ARRAY=()
+                XTC_ARRAY=()
+                LABEL_ARRAY=()
+                
+                orig_nullglob=$(shopt -p nullglob || true)
+                shopt -s nullglob
+
+                for pdb_file in *.pdb; do
+                    stem="${pdb_file%.pdb}"
+                    xtc_file="${stem}.xtc"
+                    if [[ -f "$xtc_file" ]]; then
+                        PDB_ARRAY+=("$pdb_file")
+                        XTC_ARRAY+=("$xtc_file")
+                        LABEL_ARRAY+=("$stem")
+                    fi
+                done
+                eval "$orig_nullglob"
+
+                if [ ${#PDB_ARRAY[@]} -eq 0 ]; then
+                    echo "❌ No matching PDB and XTC pairs found with identical stems."
+                    exit 1
+                fi
+
+                echo ""
+                echo "✅ Auto-detected ${#PDB_ARRAY[@]} matching dataset pair(s):"
+                for i in "${!PDB_ARRAY[@]}"; do
+                    echo "  - Pair $((i+1)): PDB=${PDB_ARRAY[i]} | XTC=${XTC_ARRAY[i]} | Label=${LABEL_ARRAY[i]}"
+                done
+
+                read -p "Output folder name [Default: auto_detected_results]: " out_dir_in
+                CUSTOM_OUT="${out_dir_in:-auto_detected_results}"
+
+                CUSTOM_PDB=$(IFS=,; echo "${PDB_ARRAY[*]}")
+                CUSTOM_XTC=$(IFS=,; echo "${XTC_ARRAY[*]}")
+                CUSTOM_LABELS=$(IFS=,; echo "${LABEL_ARRAY[*]}")
+                IS_MULTI_DATASET="true"
+            elif [[ "$ext_mode" == "2" ]]; then
+                read -p "Number of datasets to compare (e.g. 2 or 3): " num_ds
+                num_ds="${num_ds:-2}"
+                PDB_ARRAY=()
+                XTC_ARRAY=()
+                LABEL_ARRAY=()
+                for ((i=1; i<=num_ds; i++)); do
+                    echo -e "\n--- Dataset $i ---"
+                    read -p "  PDB File Path: " pdb_i
+                    read -p "  XTC File Path: " xtc_i
+                    read -p "  Dataset Label (e.g. Fenoxycarb / No_ligand): " label_i
+                    PDB_ARRAY+=("$pdb_i")
+                    XTC_ARRAY+=("$xtc_i")
+                    LABEL_ARRAY+=("${label_i:-Dataset_$i}")
+                done
+                read -p "Output folder name [Default: comparative_results]: " out_dir_in
+                CUSTOM_OUT="${out_dir_in:-comparative_results}"
+                CUSTOM_PDB=$(IFS=,; echo "${PDB_ARRAY[*]}")
+                CUSTOM_XTC=$(IFS=,; echo "${XTC_ARRAY[*]}")
+                CUSTOM_LABELS=$(IFS=,; echo "${LABEL_ARRAY[*]}")
+                IS_MULTI_DATASET="true"
+            else
+                read -p "External PDB file: " CUSTOM_PDB
+                read -p "External XTC trajectory file: " CUSTOM_XTC
+                read -p "Dataset Label [Default: External]: " CUSTOM_LABELS
+                read -p "Output folder name [Default: external_results]: " CUSTOM_OUT
+            fi
+            run_analysis
+            ;;
+        [Ss])
+            break
+            ;;
+        [Qq])
+            echo "Exiting."
+            exit 0
+            ;;
+    esac
+done
+
+echo "================================================="
+echo "   MET Pipeline Resource Configurator"
+echo "================================================="
+echo "How much heavy load do you want to use this session?"
+echo "  [1] High Load (100% - Fastest)"
+echo "  [2] Heavy Load (85%)"
+echo "  [3] Moderate Load (70%)"
+echo "  [4] Balanced Load (55%)"
+echo "  [5] Light Load (40%)"
+echo "  [6] Low Load (25% - Background tasks)"
+echo "  [7] Minimal Load (10% - Minimum impact)"
+read -p "Select load level [1-7] (Default: 1): " load_choice
+
+EXTRA_ARGS="--num_samples $NUM_SAMPLES --denoising_steps $DENOISING_STEPS --denoiser_type $DENOISER_SOLVER"
+CPU_CORES=$(nproc)
+
+case $load_choice in
+    2) THREADS=$(( CPU_CORES * 85 / 100 )); EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 40" ;;
+    3) THREADS=$(( CPU_CORES * 70 / 100 )); EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 35" ;;
+    4) THREADS=$(( CPU_CORES * 55 / 100 )); EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 25" ;;
+    5) THREADS=$(( CPU_CORES * 40 / 100 )); EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 20" ;;
+    6) THREADS=$(( CPU_CORES * 25 / 100 )); EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 10"; [ "$THREADS" -lt 2 ] && THREADS=2 ;;
+    7) THREADS=1; EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 5" ;;
+    *) THREADS=$CPU_CORES; EXTRA_ARGS="$EXTRA_ARGS --batch_size_100 50" ;;
+esac
+
+export OMP_NUM_THREADS=$THREADS
+export MKL_NUM_THREADS=$THREADS
+echo "⚙️ Set Load to ${THREADS} CPU threads."
+
+echo ""
+read -p "Do you want to start the pipeline in the BACKGROUND for the PDB in this directory? [Y/n]: " answer
+if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
+    nohup python "$INSTALL_DIR/run_pipeline.py" $EXTRA_ARGS < /dev/null > "$LOG_FILE" 2>&1 &
+    BG_PID=$!
+    disown $BG_PID 2>/dev/null || true
+    echo "✅ Pipeline is running in the background (PID: $BG_PID)."
+else
+    echo "Aborted."
+fi

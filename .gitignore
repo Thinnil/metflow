@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Trajectory and coordinate data
+*.xtc
+*.trr
+*.dcd
+*.nc
+*.pdb.gz
+
+# Analysis outputs and temporary files
+tmp_clean_heavy.pdb
+*.log
+energy_checkpoint*.csv
+global_cluster_metrics*.csv
+*.png
+*.html
+
+# Scratch and internal tools
+scratch/
+check_quote.py
+count_quotes.py
+find_max_f.py
+find_ref_bb.py
+debug_alignment.py
+b64_*.py
+
+# Environment / IDE
+.venv/
+env/
+.vscode/
+.idea/
+.DS_Store
