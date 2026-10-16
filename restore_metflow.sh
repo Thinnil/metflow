@@ -1671,8 +1671,29 @@ html_content = """<!DOCTYPE html>
         #pymol-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: var(--dark-green); color: var(--gold); padding: 30px; border: 3px solid var(--gold); border-radius: 10px; z-index: 1000; box-shadow: 0 10px 30px rgba(0,0,0,0.5); width: 80%; max-width: 600px; }
         #pymol-modal h3 { font-family: 'Playfair Display', serif; margin-top:0; }
         #pymol-code { background: #000; color: #0f0; padding: 15px; border-radius: 5px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }
-        .close-btn { background: var(--gold); color: var(--dark-green); border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; margin-top: 15px;}
-        .overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; }
+        .close-btn { background: var(--gold); color: var(--dark-green); border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; margin-top: 15px; border-radius: 5px;}
+        .overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.55); z-index: 999; backdrop-filter: blur(2px); }
+        
+        /* Interactive Image Customization & Export Modal */
+        #export-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #ffffff; color: var(--text-color); padding: 25px 30px; border: 3px solid var(--gold); border-radius: 16px; z-index: 1001; box-shadow: 0 15px 45px rgba(0,0,0,0.45); width: 92%; max-width: 820px; max-height: 90vh; overflow-y: auto; font-family: 'Lato', sans-serif; }
+        #export-modal h2 { font-family: 'Playfair Display', serif; color: var(--dark-green); margin: 0 0 15px 0; border-bottom: 2px solid var(--gold); padding-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .modal-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 20px; }
+        .modal-section { background: var(--bg-color); border: 1px solid rgba(212, 175, 55, 0.45); border-radius: 10px; padding: 12px 16px; }
+        .modal-section h4 { margin: 0 0 12px 0; color: var(--dark-green); font-family: 'Playfair Display', serif; font-size: 1.05em; border-bottom: 1px solid rgba(212, 175, 55, 0.35); padding-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+        .field-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; font-size: 0.88em; }
+        .field-row label { font-weight: 600; color: #1b3a30; }
+        .field-row input[type="text"], .field-row input[type="number"], .field-row select { width: 145px; padding: 5px 8px; border: 1px solid var(--gold); border-radius: 4px; background: #fff; font-size: 0.9em; font-family: inherit; }
+        .field-row input[type="color"] { width: 45px; height: 28px; border: 1px solid var(--gold); border-radius: 4px; cursor: pointer; padding: 0; background: none; }
+        .slider-row { margin-bottom: 10px; font-size: 0.88em; }
+        .slider-header { display: flex; justify-content: space-between; margin-bottom: 3px; font-weight: 600; color: #1b3a30; }
+        .slider-row input[type="range"] { width: 100%; cursor: pointer; accent-color: var(--dark-green); }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 18px; padding-top: 14px; border-top: 2px solid var(--gold); }
+        .btn-apply { background: #1b3a30; color: #d4af37; border: 1px solid #d4af37; padding: 9px 18px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 0.92em; }
+        .btn-apply:hover { background: #234c3f; }
+        .btn-download { background: var(--gold); color: var(--dark-green); border: none; padding: 9px 24px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 0.95em; box-shadow: 0 4px 10px rgba(0,0,0,0.15); }
+        .btn-download:hover { filter: brightness(1.1); }
+        .btn-cancel { background: #e2e8f0; color: #4a5568; border: none; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.92em; }
+        .btn-cancel:hover { background: #cbd5e1; }
     </style>
 </head>
 <body>
@@ -1688,6 +1709,7 @@ html_content = """<!DOCTYPE html>
                 <input type="file" id="file-input" style="display: none;" accept=".csv" multiple>
             </div>
             <button class="export-btn" onclick="exportCSV()">💾 Export Merged CSV</button>
+            <button class="export-btn" onclick="openExportModal()" style="margin-top: 10px; background: #1b3a30; color: #d4af37; border: 1px solid #d4af37;">🎨 Customize & Export Image</button>
             <h2>Plot Controls</h2>
             <label>Filter Dataset: <select id="sel-filter-dataset" onchange="updatePlots()">
                 <option value="all" selected>All Datasets (Combined)</option>
@@ -1718,8 +1740,11 @@ html_content = """<!DOCTYPE html>
             </div>
         </div>
         <div class="main-content">
-            <div class="plot-container" id="main-plot" style="height: 85vh; min-height: 700px;">
-                <div style="text-align:center; padding: 150px; color: #888;">Please load a CSV to visualize data.</div>
+            <div class="plot-container" id="main-plot" style="height: 85vh; min-height: 700px; position: relative;">
+                <div id="main-plot-placeholder" style="position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #888; pointer-events: none; z-index: 1;">
+                    <div style="font-size: 1.3em; font-family: 'Playfair Display', serif; color: #1b3a30; margin-bottom: 8px;">Awaiting Trajectory Data</div>
+                    <div>Drag & drop <b>global_cluster_metrics.csv</b> or wait for sample metrics to render.</div>
+                </div>
             </div>
             <div class="plot-container" id="loadings-plot" style="display: none; height: 400px;"></div>
             <div style="display: flex; gap: 20px;">
@@ -1730,13 +1755,166 @@ html_content = """<!DOCTYPE html>
             </div>
         </div>
     </div>
-    <div class="overlay" id="overlay"></div>
+    <div class="overlay" id="overlay" onclick="closeModal()"></div>
     <div id="pymol-modal">
         <h3>Frame Selected!</h3>
         <p>Frame ID: <span id="modal-frame"></span> | Cluster/Color: <span id="modal-cluster"></span> | Energy: <span id="modal-energy"></span></p>
         <p>To extract this frame in PyMOL on your server, copy and paste this command:</p>
         <div id="pymol-code"></div>
         <button class="close-btn" onclick="closeModal()">Close</button>
+    </div>
+
+    <!-- Export & Styling Customization Modal -->
+    <div id="export-modal">
+        <h2>
+            <span>🎨 Customize Image & Export</span>
+            <span style="cursor: pointer; font-size: 0.9em;" onclick="closeModal()">✖</span>
+        </h2>
+        <div class="modal-grid">
+            <!-- Section 1: Typography & Labels -->
+            <div class="modal-section">
+                <h4>🔤 Typography & Text</h4>
+                <div class="field-row">
+                    <label>Plot Title:</label>
+                    <input type="text" id="exp-title" value="Structural Landscape" oninput="liveUpdateTitle()">
+                </div>
+                <div class="field-row">
+                    <label>Font Family:</label>
+                    <select id="exp-font-family">
+                        <option value="Playfair Display, Georgia, serif" selected>Playfair Display (Serif)</option>
+                        <option value="Lato, sans-serif">Lato (Clean Sans)</option>
+                        <option value="Arial, Helvetica, sans-serif">Arial / Helvetica</option>
+                        <option value="Times New Roman, Times, serif">Times New Roman (Academic)</option>
+                        <option value="Courier New, monospace">Courier New (Monospace)</option>
+                    </select>
+                </div>
+                <div class="slider-row">
+                    <div class="slider-header"><span>Title Size:</span><span id="lbl-title-size">24 px</span></div>
+                    <input type="range" id="exp-title-size" min="14" max="44" value="24" oninput="document.getElementById('lbl-title-size').innerText = this.value + ' px'">
+                </div>
+                <div class="slider-row">
+                    <div class="slider-header"><span>Axis Label Size:</span><span id="lbl-axis-size">14 px</span></div>
+                    <input type="range" id="exp-axis-size" min="10" max="30" value="14" oninput="document.getElementById('lbl-axis-size').innerText = this.value + ' px'">
+                </div>
+                <div class="slider-row">
+                    <div class="slider-header"><span>Tick Numbers Size:</span><span id="lbl-tick-size">11 px</span></div>
+                    <input type="range" id="exp-tick-size" min="8" max="22" value="11" oninput="document.getElementById('lbl-tick-size').innerText = this.value + ' px'">
+                </div>
+                <div class="field-row">
+                    <label>Text & Label Color:</label>
+                    <input type="color" id="exp-font-color" value="#1b3a30">
+                </div>
+            </div>
+
+            <!-- Section 2: Data Points / Dots -->
+            <div class="modal-section">
+                <h4>🔴 Data Points & Dots</h4>
+                <div class="slider-row">
+                    <div class="slider-header"><span>Marker / Dot Size:</span><span id="lbl-marker-size">5 px</span></div>
+                    <input type="range" id="exp-marker-size" min="1" max="22" value="5" oninput="document.getElementById('lbl-marker-size').innerText = this.value + ' px'">
+                </div>
+                <div class="slider-row">
+                    <div class="slider-header"><span>Marker Opacity:</span><span id="lbl-marker-opacity">0.85</span></div>
+                    <input type="range" id="exp-marker-opacity" min="0.1" max="1.0" step="0.05" value="0.85" oninput="document.getElementById('lbl-marker-opacity').innerText = this.value">
+                </div>
+                <div class="slider-row">
+                    <div class="slider-header"><span>Dot Border Width:</span><span id="lbl-border-width">0 px</span></div>
+                    <input type="range" id="exp-border-width" min="0" max="3" step="0.5" value="0" oninput="document.getElementById('lbl-border-width').innerText = this.value + ' px'">
+                </div>
+                <div class="field-row">
+                    <label>Dot Border Color:</label>
+                    <input type="color" id="exp-border-color" value="#ffffff">
+                </div>
+                <div class="field-row">
+                    <label>Legend Position:</label>
+                    <select id="exp-legend-pos">
+                        <option value="right" selected>Right (Vertical)</option>
+                        <option value="top">Top (Horizontal)</option>
+                        <option value="bottom">Bottom (Horizontal)</option>
+                        <option value="none">Hidden</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Section 3: Colors & Background -->
+            <div class="modal-section">
+                <h4>🎨 Colors & Background</h4>
+                <div class="field-row">
+                    <label>Canvas Background:</label>
+                    <select id="exp-bg-mode" onchange="toggleCustomBgInput(this.value)">
+                        <option value="white" selected>Pure White (#ffffff)</option>
+                        <option value="transparent">Transparent</option>
+                        <option value="cream">Theme Cream (#f4f1ea)</option>
+                        <option value="dark">Dark Forest (#0f251e)</option>
+                        <option value="custom">Custom Color</option>
+                    </select>
+                </div>
+                <div class="field-row" id="row-custom-bg" style="display: none;">
+                    <label>Custom BG Color:</label>
+                    <input type="color" id="exp-custom-bg" value="#ffffff">
+                </div>
+                <div class="field-row">
+                    <label>Show Gridlines:</label>
+                    <input type="checkbox" id="exp-show-grid" checked>
+                </div>
+                <div class="field-row">
+                    <label>Gridline Color:</label>
+                    <input type="color" id="exp-grid-color" value="#e2e8f0">
+                </div>
+                <div class="field-row">
+                    <label>Show Zero Line:</label>
+                    <input type="checkbox" id="exp-show-zeroline" checked>
+                </div>
+            </div>
+
+            <!-- Section 4: Resolution & File Format -->
+            <div class="modal-section">
+                <h4>📐 Dimensions & Resolution</h4>
+                <div class="field-row">
+                    <label>Dimension Preset:</label>
+                    <select id="exp-preset" onchange="applyPresetDimensions(this.value)">
+                        <option value="1200x800">Standard Web (1200 x 800)</option>
+                        <option value="1920x1080" selected>Full HD 1080p (1920 x 1080)</option>
+                        <option value="2560x1440">2K QHD (2560 x 1440)</option>
+                        <option value="3840x2160">4K Ultra HD (3840 x 2160)</option>
+                        <option value="1050x800">Journal Single-Col (1050 x 800)</option>
+                        <option value="2100x1400">Journal Double-Col (2100 x 1400)</option>
+                        <option value="custom">Custom Width / Height</option>
+                    </select>
+                </div>
+                <div class="field-row">
+                    <label>Width (pixels):</label>
+                    <input type="number" id="exp-width" value="1920" min="400" max="7680">
+                </div>
+                <div class="field-row">
+                    <label>Height (pixels):</label>
+                    <input type="number" id="exp-height" value="1080" min="300" max="4320">
+                </div>
+                <div class="field-row">
+                    <label>Resolution / DPI Scale:</label>
+                    <select id="exp-scale">
+                        <option value="1">1x (Standard ~96 DPI)</option>
+                        <option value="2" selected>2x (HiDPI / Retina ~192 DPI)</option>
+                        <option value="3">3x (Publication Print ~300 DPI)</option>
+                        <option value="4">4x (Ultra Publication ~400 DPI)</option>
+                    </select>
+                </div>
+                <div class="field-row">
+                    <label>Export Format:</label>
+                    <select id="exp-format">
+                        <option value="png" selected>PNG (.png - Lossless)</option>
+                        <option value="svg">SVG (.svg - Vector Graphics)</option>
+                        <option value="jpeg">JPEG (.jpg - Web)</option>
+                        <option value="webp">WebP (.webp)</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+            <button class="btn-apply" onclick="applySettingsToLiveView()">👁️ Apply to Dashboard View</button>
+            <button class="btn-download" onclick="downloadCustomImage()">💾 Download High-Res Image</button>
+        </div>
     </div>
     <script>
         const EMBEDDED_METRICS_JSON = /*EMBEDDED_DATA_PLACEHOLDER*/[];
@@ -1762,6 +1940,8 @@ html_content = """<!DOCTYPE html>
 
         window.addEventListener('DOMContentLoaded', () => {
             if (Array.isArray(EMBEDDED_METRICS_JSON) && EMBEDDED_METRICS_JSON.length > 0) {
+                const ph = document.getElementById('main-plot-placeholder');
+                if (ph) { ph.style.display = 'none'; ph.remove(); }
                 globalData = EMBEDDED_METRICS_JSON;
                 cols = Object.keys(globalData[0]);
                 populateDropdowns();
@@ -1773,6 +1953,8 @@ html_content = """<!DOCTYPE html>
                 .then(text => {
                     Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true, complete: function(res) {
                         if (res.meta && res.meta.fields) {
+                            const ph = document.getElementById('main-plot-placeholder');
+                            if (ph) { ph.style.display = 'none'; ph.remove(); }
                             globalData = res.data;
                             cols = res.meta.fields;
                             populateDropdowns();
@@ -1783,6 +1965,8 @@ html_content = """<!DOCTYPE html>
         });
         
         function processFile(file) {
+            const ph = document.getElementById('main-plot-placeholder');
+            if (ph) { ph.style.display = 'none'; ph.remove(); }
             Papa.parse(file, { header: true, dynamicTyping: true, skipEmptyLines: true,
                 complete: function(results) {
                     if (results.meta.fields.includes('Residue') && results.meta.fields.includes('PC1_Contribution')) {
@@ -1922,16 +2106,41 @@ html_content = """<!DOCTYPE html>
             if (el) el.addEventListener('change', updatePlots); 
         });
         
+        let customSettings = {
+            title: 'Structural Landscape',
+            fontFamily: 'Playfair Display, Georgia, serif',
+            fontColor: '#1b3a30',
+            titleSize: 24,
+            axisLabelSize: 14,
+            tickSize: 11,
+            markerSize: 5,
+            markerOpacity: 0.85,
+            borderWidth: 0,
+            borderColor: '#ffffff',
+            bgMode: 'white',
+            customBg: '#ffffff',
+            showGrid: true,
+            showZeroLine: true,
+            gridColor: '#e2e8f0',
+            legendPos: 'right',
+            width: 1920,
+            height: 1080,
+            scale: 2,
+            format: 'png'
+        };
+
         function updatePlots() {
             if(globalLoadings.length > 0) {
                 document.getElementById('loadings-plot').style.display = 'block';
                 Plotly.react('loadings-plot', [
                     { x: globalLoadings.map(d=>d.Residue), y: globalLoadings.map(d=>d.PC1_Contribution), name: 'PC1', type: 'scatter', mode: 'lines+markers', line: {color: '#1b3a30'} },
                     { x: globalLoadings.map(d=>d.Residue), y: globalLoadings.map(d=>d.PC2_Contribution), name: 'PC2', type: 'scatter', mode: 'lines+markers', line: {color: '#d4af37'} }
-                ], { title: {text: 'PCA Loadings (Residue Contribution)', font: {family: 'Playfair Display', color: '#1b3a30'}}, xaxis: {title: 'Residue Number'}, yaxis: {title: 'Loading Magnitude'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
+                ], { title: {text: 'PCA Loadings (Residue Contribution)', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Residue Number'}, yaxis: {title: 'Loading Magnitude'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
             }
             
             if(!globalData.length) return;
+            const ph = document.getElementById('main-plot-placeholder');
+            if (ph) { ph.style.display = 'none'; ph.remove(); }
             
             let plotData = globalData;
             const selDataset = document.getElementById('sel-filter-dataset') ? document.getElementById('sel-filter-dataset').value : 'all';
@@ -2012,7 +2221,12 @@ html_content = """<!DOCTYPE html>
                         x: indices.map(i => x[i]),
                         y: indices.map(i => y[i]),
                         mode: 'markers',
-                        marker: { size: 5, color: c },
+                        marker: {
+                            size: customSettings.markerSize,
+                            color: c,
+                            opacity: customSettings.markerOpacity,
+                            line: { width: customSettings.borderWidth, color: customSettings.borderColor }
+                        },
                         text: indices.map(i => hovertext[i]),
                         hoverinfo: 'text+x+y+z',
                         customdata: indices.map(i => plotData[i])
@@ -2114,9 +2328,10 @@ html_content = """<!DOCTYPE html>
                                 y: b.indices.map(i => y[i]),
                                 mode: 'markers',
                                 marker: {
-                                    size: isHighOutlier ? 4 : (isNaNGroup ? 3.5 : 5),
+                                    size: isHighOutlier ? Math.max(3, customSettings.markerSize - 1) : (isNaNGroup ? Math.max(2.5, customSettings.markerSize - 1.5) : customSettings.markerSize),
                                     color: b.color,
-                                    opacity: isNaNGroup ? 0.35 : (isHighOutlier ? 0.85 : 0.85)
+                                    opacity: isNaNGroup ? 0.35 : customSettings.markerOpacity,
+                                    line: { width: customSettings.borderWidth, color: customSettings.borderColor }
                                 },
                                 text: b.indices.map(i => hovertext[i]),
                                 hoverinfo: 'text+x+y+z',
@@ -2151,13 +2366,18 @@ html_content = """<!DOCTYPE html>
                         y: validIndices.map(i => y[i]),
                         mode: 'markers',
                         marker: {
-                            size: 5,
+                            size: customSettings.markerSize,
                             color: validIndices.map(i => numericVals[i]),
                             colorscale: cScale,
                             cmin: cmin,
                             cmax: cmax,
+                            opacity: customSettings.markerOpacity,
+                            line: { width: customSettings.borderWidth, color: customSettings.borderColor },
                             showscale: true,
-                            colorbar: { title: cColor }
+                            colorbar: {
+                                title: { text: cColor, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                                tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor }
+                            }
                         },
                         text: validIndices.map(i => hovertext[i]),
                         hoverinfo: 'text+x+y+z',
@@ -2174,7 +2394,12 @@ html_content = """<!DOCTYPE html>
                         x: nanIndices.map(i => x[i]),
                         y: nanIndices.map(i => y[i]),
                         mode: 'markers',
-                        marker: { size: 3.5, color: '#9ca3af', opacity: 0.4 },
+                        marker: {
+                            size: Math.max(2.5, customSettings.markerSize - 1.5),
+                            color: '#9ca3af',
+                            opacity: 0.4,
+                            line: { width: customSettings.borderWidth, color: customSettings.borderColor }
+                        },
                         text: nanIndices.map(i => hovertext[i]),
                         hoverinfo: 'text+x+y+z',
                         customdata: nanIndices.map(i => plotData[i])
@@ -2185,17 +2410,65 @@ html_content = """<!DOCTYPE html>
                 }
             }
             
+            let liveBg = 'rgba(0,0,0,0)';
+            if (customSettings.bgMode === 'white') liveBg = '#ffffff';
+            else if (customSettings.bgMode === 'cream') liveBg = '#f4f1ea';
+            else if (customSettings.bgMode === 'dark') liveBg = '#0f251e';
+            else if (customSettings.bgMode === 'custom') liveBg = customSettings.customBg;
+
+            let legendConfig = {
+                title: { text: cColor, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                orientation: 'v',
+                x: 1.02,
+                y: 1,
+                font: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor }
+            };
+            if (customSettings.legendPos === 'none') {
+                legendConfig = false;
+            } else if (customSettings.legendPos === 'top') {
+                legendConfig = { title: { text: cColor }, orientation: 'h', y: 1.12, x: 0, font: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor } };
+            } else if (customSettings.legendPos === 'bottom') {
+                legendConfig = { title: { text: cColor }, orientation: 'h', y: -0.22, x: 0, font: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor } };
+            }
+
             let layout = {
-                title: { text: 'Structural Landscape', font: {family: 'Playfair Display', size: 24, color: '#1b3a30'} },
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                margin: {l: 50, r: 50, b: 50, t: 80},
-                font: {family: 'Lato', color: '#1b3a30'},
-                showlegend: true,
-                legend: { title: { text: cColor }, orientation: 'v', x: 1.02, y: 1 }
+                title: { text: customSettings.title, font: {family: customSettings.fontFamily, size: customSettings.titleSize, color: customSettings.fontColor} },
+                paper_bgcolor: liveBg,
+                plot_bgcolor: liveBg,
+                margin: {l: 60, r: 60, b: 65, t: 80},
+                font: {family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor},
+                showlegend: customSettings.legendPos !== 'none',
+                legend: (customSettings.legendPos !== 'none') ? legendConfig : undefined,
+                xaxis: {
+                    title: { text: cx, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
+                    showgrid: customSettings.showGrid,
+                    gridcolor: customSettings.gridColor,
+                    zeroline: customSettings.showZeroLine
+                },
+                yaxis: {
+                    title: { text: cy, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
+                    showgrid: customSettings.showGrid,
+                    gridcolor: customSettings.gridColor,
+                    zeroline: customSettings.showZeroLine
+                }
+            };
+
+            const plotConfig = {
+                responsive: true,
+                displayModeBar: true,
+                modeBarButtonsToAdd: [{
+                    name: '🎨 Customize & Export High-Res Image',
+                    icon: Plotly.Icons.camera,
+                    click: function() {
+                        openExportModal();
+                    }
+                }],
+                modeBarButtonsToRemove: ['toImage']
             };
             
-            Plotly.react('main-plot', traces, layout, {responsive: true});
+            Plotly.react('main-plot', traces, layout, plotConfig);
             
             const mainPlotEl = document.getElementById('main-plot');
             if (!mainPlotEl._hasClickBound) {
@@ -2228,12 +2501,155 @@ html_content = """<!DOCTYPE html>
                     const q3 = sorted_e[Math.floor(sorted_e.length * 0.75)];
                     const iqr = q3 - q1;
                     const e_filt = (iqr > 0) ? e_vals.filter(v => v >= q1 - 2*iqr && v <= q3 + 2*iqr) : e_vals;
-                    Plotly.react('timeseries-plot', [{ x: frames, y: plotData.map(d => d['OpenMM_Energy_kcal_mol']), type: 'scatter', mode: 'lines', line: {color: '#d4af37'} }], { title: {text: 'Energy Progression', font: {family: 'Playfair Display', color: '#1b3a30'}}, xaxis: {title: 'Frame Index'}, yaxis: {title: 'Energy (kcal/mol)'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
-                    Plotly.react('hist-plot', [{ x: e_filt, type: 'histogram', marker: {color: '#0f251e'} }], { title: {text: 'Energy Distribution (Representative Subset)', font: {family: 'Playfair Display', color: '#1b3a30'}}, xaxis: {title: 'Energy (kcal/mol)'}, yaxis: {title: 'Frequency'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
+                    Plotly.react('timeseries-plot', [{ x: frames, y: plotData.map(d => d['OpenMM_Energy_kcal_mol']), type: 'scatter', mode: 'lines', line: {color: '#d4af37'} }], { title: {text: 'Energy Progression', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Frame Index'}, yaxis: {title: 'Energy (kcal/mol)'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
+                    Plotly.react('hist-plot', [{ x: e_filt, type: 'histogram', marker: {color: '#0f251e'} }], { title: {text: 'Energy Distribution (Representative Subset)', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Energy (kcal/mol)'}, yaxis: {title: 'Frequency'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
                 }
             }
         }
-        function closeModal() { document.getElementById('overlay').style.display = 'none'; document.getElementById('pymol-modal').style.display = 'none'; }
+
+        function openExportModal() {
+            document.getElementById('exp-title').value = customSettings.title;
+            document.getElementById('exp-font-family').value = customSettings.fontFamily;
+            document.getElementById('exp-title-size').value = customSettings.titleSize;
+            document.getElementById('lbl-title-size').innerText = customSettings.titleSize + ' px';
+            document.getElementById('exp-axis-size').value = customSettings.axisLabelSize;
+            document.getElementById('lbl-axis-size').innerText = customSettings.axisLabelSize + ' px';
+            document.getElementById('exp-tick-size').value = customSettings.tickSize;
+            document.getElementById('lbl-tick-size').innerText = customSettings.tickSize + ' px';
+            document.getElementById('exp-font-color').value = customSettings.fontColor;
+            
+            document.getElementById('exp-marker-size').value = customSettings.markerSize;
+            document.getElementById('lbl-marker-size').innerText = customSettings.markerSize + ' px';
+            document.getElementById('exp-marker-opacity').value = customSettings.markerOpacity;
+            document.getElementById('lbl-marker-opacity').innerText = customSettings.markerOpacity;
+            document.getElementById('exp-border-width').value = customSettings.borderWidth;
+            document.getElementById('lbl-border-width').innerText = customSettings.borderWidth + ' px';
+            document.getElementById('exp-border-color').value = customSettings.borderColor;
+            document.getElementById('exp-legend-pos').value = customSettings.legendPos;
+            
+            document.getElementById('exp-bg-mode').value = customSettings.bgMode;
+            toggleCustomBgInput(customSettings.bgMode);
+            document.getElementById('exp-custom-bg').value = customSettings.customBg;
+            document.getElementById('exp-show-grid').checked = customSettings.showGrid;
+            document.getElementById('exp-grid-color').value = customSettings.gridColor;
+            document.getElementById('exp-show-zeroline').checked = customSettings.showZeroLine;
+            
+            document.getElementById('exp-width').value = customSettings.width;
+            document.getElementById('exp-height').value = customSettings.height;
+            document.getElementById('exp-scale').value = customSettings.scale;
+            document.getElementById('exp-format').value = customSettings.format;
+            
+            document.getElementById('overlay').style.display = 'block';
+            document.getElementById('export-modal').style.display = 'block';
+        }
+
+        function toggleCustomBgInput(mode) {
+            const row = document.getElementById('row-custom-bg');
+            if (row) row.style.display = (mode === 'custom') ? 'flex' : 'none';
+        }
+
+        function applyPresetDimensions(preset) {
+            if (preset === '1200x800') { document.getElementById('exp-width').value = 1200; document.getElementById('exp-height').value = 800; }
+            else if (preset === '1920x1080') { document.getElementById('exp-width').value = 1920; document.getElementById('exp-height').value = 1080; }
+            else if (preset === '2560x1440') { document.getElementById('exp-width').value = 2560; document.getElementById('exp-height').value = 1440; }
+            else if (preset === '3840x2160') { document.getElementById('exp-width').value = 3840; document.getElementById('exp-height').value = 2160; }
+            else if (preset === '1050x800') { document.getElementById('exp-width').value = 1050; document.getElementById('exp-height').value = 800; }
+            else if (preset === '2100x1400') { document.getElementById('exp-width').value = 2100; document.getElementById('exp-height').value = 1400; }
+        }
+
+        function liveUpdateTitle() {
+            const val = document.getElementById('exp-title').value;
+            customSettings.title = val || 'Structural Landscape';
+        }
+
+        function updateSettingsFromModal() {
+            customSettings.title = document.getElementById('exp-title').value || 'Structural Landscape';
+            customSettings.fontFamily = document.getElementById('exp-font-family').value;
+            customSettings.titleSize = parseInt(document.getElementById('exp-title-size').value) || 24;
+            customSettings.axisLabelSize = parseInt(document.getElementById('exp-axis-size').value) || 14;
+            customSettings.tickSize = parseInt(document.getElementById('exp-tick-size').value) || 11;
+            customSettings.fontColor = document.getElementById('exp-font-color').value;
+            
+            customSettings.markerSize = parseFloat(document.getElementById('exp-marker-size').value) || 5;
+            customSettings.markerOpacity = parseFloat(document.getElementById('exp-marker-opacity').value) || 0.85;
+            customSettings.borderWidth = parseFloat(document.getElementById('exp-border-width').value) || 0;
+            customSettings.borderColor = document.getElementById('exp-border-color').value;
+            customSettings.legendPos = document.getElementById('exp-legend-pos').value;
+            
+            customSettings.bgMode = document.getElementById('exp-bg-mode').value;
+            customSettings.customBg = document.getElementById('exp-custom-bg').value;
+            customSettings.showGrid = document.getElementById('exp-show-grid').checked;
+            customSettings.gridColor = document.getElementById('exp-grid-color').value;
+            customSettings.showZeroLine = document.getElementById('exp-show-zeroline').checked;
+            
+            customSettings.width = parseInt(document.getElementById('exp-width').value) || 1920;
+            customSettings.height = parseInt(document.getElementById('exp-height').value) || 1080;
+            customSettings.scale = parseFloat(document.getElementById('exp-scale').value) || 2;
+            customSettings.format = document.getElementById('exp-format').value || 'png';
+        }
+
+        function applySettingsToLiveView() {
+            updateSettingsFromModal();
+            updatePlots();
+            closeModal();
+        }
+
+        function downloadCustomImage() {
+            updateSettingsFromModal();
+            
+            let exportBg = '#ffffff';
+            if (customSettings.bgMode === 'transparent') exportBg = 'rgba(0,0,0,0)';
+            else if (customSettings.bgMode === 'cream') exportBg = '#f4f1ea';
+            else if (customSettings.bgMode === 'dark') exportBg = '#0f251e';
+            else if (customSettings.bgMode === 'custom') exportBg = customSettings.customBg;
+
+            const mainEl = document.getElementById('main-plot');
+            const cx = document.getElementById('sel-x') ? document.getElementById('sel-x').value : 'X';
+            const cy = document.getElementById('sel-y') ? document.getElementById('sel-y').value : 'Y';
+            const cleanTitle = (customSettings.title || 'plot').replace(/[^a-zA-Z0-9_-]/g, '_');
+            const filename = `metflow_${cleanTitle}_${cx}_vs_${cy}`;
+
+            Plotly.relayout(mainEl, {
+                title: { text: customSettings.title, font: {family: customSettings.fontFamily, size: customSettings.titleSize, color: customSettings.fontColor} },
+                paper_bgcolor: exportBg,
+                plot_bgcolor: exportBg,
+                font: {family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor},
+                xaxis: {
+                    title: { text: cx, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
+                    showgrid: customSettings.showGrid,
+                    gridcolor: customSettings.gridColor,
+                    zeroline: customSettings.showZeroLine
+                },
+                yaxis: {
+                    title: { text: cy, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
+                    showgrid: customSettings.showGrid,
+                    gridcolor: customSettings.gridColor,
+                    zeroline: customSettings.showZeroLine
+                }
+            }).then(() => {
+                return Plotly.downloadImage(mainEl, {
+                    format: customSettings.format,
+                    width: customSettings.width,
+                    height: customSettings.height,
+                    scale: customSettings.scale,
+                    filename: filename
+                });
+            }).then(() => {
+                closeModal();
+            }).catch(err => {
+                console.error("Download failed:", err);
+                closeModal();
+            });
+        }
+
+        function closeModal() {
+            document.getElementById('overlay').style.display = 'none';
+            document.getElementById('pymol-modal').style.display = 'none';
+            const expM = document.getElementById('export-modal');
+            if (expM) expM.style.display = 'none';
+        }
     </script>
 </body>
 </html>"""
