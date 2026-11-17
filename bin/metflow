@@ -4,6 +4,15 @@ set -e
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || readlink -f "$BASH_SOURCE")
 BIN_DIR=$(dirname "$SCRIPT_PATH")
 INSTALL_DIR=$(dirname "$BIN_DIR")
+if [ ! -f "$INSTALL_DIR/analyze_trajectory.py" ]; then
+    if [ -f "./analyze_trajectory.py" ]; then
+        INSTALL_DIR="$(pwd)"
+    elif [ -f "$BIN_DIR/analyze_trajectory.py" ]; then
+        INSTALL_DIR="$BIN_DIR"
+    elif [ -f "$HOME/metflow_pipeline/analyze_trajectory.py" ]; then
+        INSTALL_DIR="$HOME/metflow_pipeline"
+    fi
+fi
 MAMBA_BIN=$(command -v micromamba || echo "$HOME/.local/bin/micromamba")
 
 eval "$("$MAMBA_BIN" shell hook --shell=bash)"

@@ -206,51 +206,365 @@ finally:
 EOF
 
 cat << 'EOF' > "$INSTALL_DIR/analyze_trajectory.py"
-import sys
-import os
+"""Backward-compatible CLI entrypoint for MET Flow (v2.8 MULTI-SOURCE).
 
-# --- Fast Path for Option [D] (Dashboard ONLY) ---
-# Generates dashboard instantly without importing heavy packages or running dependency checks
-if "--only_dashboard" in sys.argv:
+Delegates execution to scripts/run_pipeline.py.
+"""
+
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from scripts.run_pipeline import main
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+
+cp -f "$INSTALL_DIR/analyze_trajectory.py" "./analyze_trajectory.py" 2>/dev/null || true
+
+# METFLOW_MODULES_START
+mkdir -p "$INSTALL_DIR/metflow"
+mkdir -p "$INSTALL_DIR/metflow/stage1_ingestion"
+mkdir -p "$INSTALL_DIR/metflow/stage2_skimming"
+mkdir -p "$INSTALL_DIR/metflow/stage3_reduction"
+mkdir -p "$INSTALL_DIR/metflow/stage4_clustering"
+mkdir -p "$INSTALL_DIR/metflow/stage5_energy"
+mkdir -p "$INSTALL_DIR/metflow/stage6_visualization"
+mkdir -p "$INSTALL_DIR/scripts"
+cat << 'EOF' > "$INSTALL_DIR/scripts/run_pipeline.py"
+"""Central Orchestrator for the MET Flow (v2.8 MULTI-SOURCE) modular pipeline."""
+
+import logging
+import os
+import sys
+from typing import Callable, List, Optional, Tuple
+
+# Ensure project root is on sys.path when invoked as `python scripts/run_pipeline.py`
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from metflow.cli import parse_args_to_config, validate_out_dir
+from metflow.deps import install_deps
+from metflow.models import PipelineConfig, StageResult, TrajectoryContext
+from metflow.stage1_ingestion.loader import run_stage1
+from metflow.stage2_skimming.skimmer import run_stage2
+from metflow.stage3_reduction.allostery import run_stage3
+from metflow.stage4_clustering.cnn import run_stage4
+from metflow.stage5_energy.openmm_engine import run_stage5
+from metflow.stage6_visualization.dashboard import generate_dashboard
+from metflow.stage6_visualization.reports import run_stage6
+
+logger = logging.getLogger("metflow.orchestrator")
+
+
+def _run_only_dashboard(argv: Optional[List[str]] = None, base_dir: str = ".") -> int:
+    """Fast path for --only_dashboard true without importing heavy scientific packages."""
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    out_dir = "clustering_results"
+    if "--out_dir" in raw_args:
+        out_idx = raw_args.index("--out_dir")
+        if out_idx + 1 < len(raw_args):
+            out_dir = raw_args[out_idx + 1]
     try:
-        idx = sys.argv.index("--only_dashboard")
-        if idx + 1 < len(sys.argv) and sys.argv[idx + 1].lower() == "true":
-            out_dir = "clustering_results"
-            if "--out_dir" in sys.argv:
-                out_idx = sys.argv.index("--out_dir")
-                if out_idx + 1 < len(sys.argv):
-                    out_dir = sys.argv[out_idx + 1]
-            out_dir_abs = os.path.abspath(out_dir)
-            base_dir_abs = os.path.abspath('.')
+        out_dir_abs = validate_out_dir(out_dir, base_dir=base_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    dash_file = generate_dashboard(out_dir_abs, df=None)
+    print(f"\n✅ Dashboard generated instantly at {dash_file}")
+    return 0
+
+
+def _close_universe_readers(ctx: TrajectoryContext) -> None:
+    """Close any open MDAnalysis trajectory readers stored in ctx."""
+    seen = set()
+    for u_obj in ctx.universes:
+        if id(u_obj) in seen:
+            continue
+        seen.add(id(u_obj))
+        try:
+            u_obj.trajectory.close()
+        except Exception:
+            pass
+    for entry in ctx.temp_universes:
+        if isinstance(entry, tuple) and len(entry) >= 4:
+            u_obj = entry[3]
+            if id(u_obj) in seen:
+                continue
+            seen.add(id(u_obj))
             try:
-                if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
-                    print("Error: Directory traversal blocked")
-                    sys.exit(1)
-            except ValueError:
-                print("Error: Directory traversal blocked")
-                sys.exit(1)
-            os.makedirs(out_dir_abs, exist_ok=True)
-            with open(__file__, "r", encoding="utf-8") as f:
-                content = f.read()
+                u_obj.trajectory.close()
+            except Exception:
+                pass
+
+
+def run_stages(
+    ctx: TrajectoryContext,
+    stages: Optional[List[Tuple[str, Callable[[TrajectoryContext], StageResult]]]] = None,
+) -> int:
+    """Execute pipeline stages sequentially, verifying StageResult and handling errors."""
+    if stages is None:
+        stages = [
+            ("Stage 1 (Ingestion & Alignment)", run_stage1),
+            ("Stage 2 (Skimming & Sampling)", run_stage2),
+            ("Stage 3 (Reduction & Allostery)", run_stage3),
+            ("Stage 4 (Clustering)", run_stage4),
+            ("Stage 5 (OpenMM Energy & Fusion)", run_stage5),
+            ("Stage 6 (Visualization & Reports)", run_stage6),
+        ]
+
+    try:
+        for stage_label, stage_fn in stages:
             try:
-                start_marker = "<!DOC" + "TYPE html>"
-                end_marker = "</ht" + "ml>"
-                html = start_marker + content.split(start_marker)[1].split(end_marker)[0] + end_marker
-            except IndexError:
-                print("❌ Error: Could not find HTML block in script source.")
-                sys.exit(1)
-            dash_file = os.path.join(out_dir_abs, "metflow_dashboard.html")
-            with open(dash_file, "w", encoding="utf-8") as f:
-                f.write(html)
-            print(f"\n✅ Dashboard generated instantly at {dash_file}")
-            sys.exit(0)
-    except Exception as e:
-        pass
+                result = stage_fn(ctx)
+            except KeyboardInterrupt:
+                logger.warning("Pipeline interrupted by user during %s.", stage_label)
+                print(f"\n⚠️ Pipeline interrupted by user during {stage_label}. Exiting cleanly.")
+                return 130
+            except Exception as exc:
+                logger.exception("Pipeline failed in %s: %s", stage_label, exc)
+                print(f"\n❌ Error in {stage_label}: {exc}")
+                return 1
+
+            if not isinstance(result, StageResult):
+                logger.error("%s did not return a StageResult instance.", stage_label)
+                print(f"\n❌ Internal Error in {stage_label}: invalid stage result.")
+                return 1
+
+            if not result.success or result.exit_code != 0:
+                err_msg = result.error or f"exit_code={result.exit_code}"
+                logger.error("%s failed: %s", stage_label, err_msg)
+                print(f"\n❌ {stage_label} failed: {err_msg}")
+                return result.exit_code if result.exit_code != 0 else 1
+
+            if ctx.energy_interrupted:
+                return 0
+
+        return 0
+    finally:
+        _close_universe_readers(ctx)
+
+
+def main(
+    argv: Optional[List[str]] = None,
+    base_dir: str = ".",
+    check_deps: bool = True,
+) -> int:
+    """Main orchestrator entrypoint."""
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+
+    # Fast path for --only_dashboard true
+    if "--only_dashboard" in raw_args:
+        idx = raw_args.index("--only_dashboard")
+        if idx + 1 < len(raw_args) and raw_args[idx + 1].lower() == "true":
+            return _run_only_dashboard(raw_args, base_dir=base_dir)
+
+    try:
+        config: PipelineConfig = parse_args_to_config(raw_args, base_dir=base_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 1
+
+    if config.is_only_dashboard:
+        return _run_only_dashboard(raw_args, base_dir=base_dir)
+
+    if check_deps:
+        install_deps()
+
+    print("\n==================================================")
+    print("   Initializing Post-Generation Analysis (v2.8 MULTI-SOURCE)")
+    print("==================================================")
+    print("--------------------------------------------------")
+
+    ctx = TrajectoryContext(config=config, out_dir=config.out_dir)
+    return run_stages(ctx)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/__init__.py"
+"""MET Flow (v2.8 MULTI-SOURCE) modular trajectory analysis package."""
+
+from metflow.models import PipelineConfig, StageResult, TrajectoryContext
+
+__version__ = "2.8.0"
+__all__ = ["PipelineConfig", "StageResult", "TrajectoryContext", "__version__"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/cli.py"
+"""CLI argument parsing, path-traversal validation, and parameter persistence."""
+
+import argparse
+import os
+from typing import List, Optional
+
+from metflow.models import PipelineConfig
+
+
+def parse_res_string(res_str: str) -> List[int]:
+    """Parse residue range/list strings like '10-20, 25 30' into integer residue IDs."""
+    res_list: List[int] = []
+    for part in res_str.replace(",", " ").split():
+        if "-" in part:
+            start, end = map(int, part.split("-"))
+            res_list.extend(range(start, end + 1))
+        else:
+            res_list.append(int(part))
+    return res_list
+
+
+def parse_list_arg(arg_str: str) -> List[str]:
+    """Parse comma- or whitespace-separated CLI list arguments."""
+    if not arg_str:
+        return []
+    if "," in arg_str:
+        return [x.strip() for x in arg_str.split(",") if x.strip()]
+    return [x.strip() for x in arg_str.split() if x.strip()]
+
+
+def validate_out_dir(out_dir: str, base_dir: str = ".") -> str:
+    """Resolve out_dir against base_dir and block directory traversal outside base_dir."""
+    base_dir_abs = os.path.abspath(base_dir)
+    if os.path.isabs(out_dir):
+        out_dir_abs = os.path.abspath(out_dir)
+    else:
+        out_dir_abs = os.path.abspath(os.path.join(base_dir_abs, out_dir))
+    try:
+        if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
+            raise ValueError(f"Directory traversal blocked: {out_dir}")
+    except ValueError as exc:
+        raise ValueError(f"Directory traversal blocked: {out_dir}") from exc
+    return out_dir_abs
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the ArgumentParser with all 27 MET Flow flags and exact defaults."""
+    parser = argparse.ArgumentParser(description="MET Flow Trajectory Analysis & Clustering")
+    parser.add_argument("--skim", type=str, default="false")
+    parser.add_argument("--equator", type=str, default="")
+    parser.add_argument("--top", type=str, default="")
+    parser.add_argument("--bottom", type=str, default="")
+    parser.add_argument("--min_vol", type=float, default=300.0)
+    parser.add_argument("--cluster", type=str, default="pca_kmeans")
+    parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--rmsd", type=float, default=2.0)
+    parser.add_argument("--cnn_eps", type=float, default=3.0)
+    parser.add_argument("--allostery", type=str, default="false")
+    parser.add_argument("--cavity_res", type=str, default="")
+    parser.add_argument("--loop_res", type=str, default="")
+    parser.add_argument("--pca_res", type=str, default="")
+    parser.add_argument("--advanced_plots", type=str, default="false")
+    parser.add_argument("--gen_params", type=str, default="")
+    parser.add_argument("--dataset_configs", type=str, default="")
+    parser.add_argument("--pdb", type=str, default="")
+    parser.add_argument("--xtc", type=str, default="")
+    parser.add_argument("--multi_datasets", type=str, default="false")
+    parser.add_argument("--dataset_labels", type=str, default="")
+    parser.add_argument("--out_dir", type=str, default="clustering_results")
+    parser.add_argument("--calc_energy", type=str, default="false")
+    parser.add_argument("--only_energy", type=str, default="false")
+    parser.add_argument("--only_dashboard", type=str, default="false")
+    parser.add_argument("--max_frames", type=int, default=0)
+    parser.add_argument("--min_steps", type=int, default=100)
+    parser.add_argument("--pca_ref", type=str, default="combined")
+    return parser
+
+
+def parse_args_to_config(
+    argv: Optional[List[str]] = None,
+    base_dir: str = ".",
+) -> PipelineConfig:
+    """Parse CLI arguments, validate output directory, and return PipelineConfig."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    validated_out_dir = validate_out_dir(args.out_dir, base_dir=base_dir)
+
+    config = PipelineConfig(
+        skim=args.skim,
+        equator=args.equator,
+        top=args.top,
+        bottom=args.bottom,
+        min_vol=args.min_vol,
+        cluster=args.cluster,
+        k=args.k,
+        rmsd=args.rmsd,
+        cnn_eps=args.cnn_eps,
+        allostery=args.allostery,
+        cavity_res=args.cavity_res,
+        loop_res=args.loop_res,
+        pca_res=args.pca_res,
+        advanced_plots=args.advanced_plots,
+        gen_params=args.gen_params,
+        dataset_configs=args.dataset_configs,
+        pdb=args.pdb,
+        xtc=args.xtc,
+        multi_datasets=args.multi_datasets,
+        dataset_labels=args.dataset_labels,
+        out_dir=validated_out_dir,
+        calc_energy=args.calc_energy,
+        only_energy=args.only_energy,
+        only_dashboard=args.only_dashboard,
+        max_frames=args.max_frames,
+        min_steps=args.min_steps,
+        pca_ref=args.pca_ref,
+        base_dir=os.path.abspath(base_dir),
+    )
+
+    if config.is_only_energy:
+        config.skim = "false"
+        config.allostery = "false"
+        config.cluster = "none"
+        config.calc_energy = "true"
+
+    return config
+
+
+def save_params(config: PipelineConfig, out_dir: str, base_dir: str = ".") -> str:
+    """Save run parameters to out_dir/metflow_params.txt (and cwd if different)."""
+    os.makedirs(out_dir, exist_ok=True)
+    param_keys = [
+        "skim", "equator", "top", "bottom", "min_vol", "cluster", "k",
+        "rmsd", "cnn_eps", "allostery", "cavity_res", "loop_res", "pca_res",
+        "advanced_plots", "gen_params", "dataset_configs", "pdb", "xtc",
+        "multi_datasets", "dataset_labels", "out_dir", "calc_energy",
+        "only_energy", "only_dashboard", "max_frames", "min_steps", "pca_ref",
+    ]
+    param_str = "\n".join(f"{k}={getattr(config, k)}" for k in param_keys) + "\n"
+    out_param_path = os.path.join(out_dir, "metflow_params.txt")
+    with open(out_param_path, "w", encoding="utf-8") as f_param:
+        f_param.write(param_str)
+
+    base_dir_abs = os.path.abspath(base_dir)
+    if os.path.abspath(out_dir) != base_dir_abs:
+        try:
+            with open(os.path.join(base_dir_abs, "metflow_params.txt"), "w", encoding="utf-8") as f_param2:
+                f_param2.write(param_str)
+        except Exception:
+            pass
+    return out_param_path
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/deps.py"
+"""Dependency verification and installation helper."""
 
 import subprocess
+import sys
 
-# Auto-install analysis dependencies if missing (Fast in-process check)
-def install_deps():
+
+def install_deps() -> None:
+    """Install missing analysis dependencies if needed.
+
+    Only invoked from the CLI/orchestrator entrypoint when running full analysis,
+    never at module import time.
+    """
     mod_map = {
         "scikit-learn": "sklearn",
         "scipy": "scipy",
@@ -258,7 +572,7 @@ def install_deps():
         "pandas": "pandas",
         "matplotlib": "matplotlib",
         "seaborn": "seaborn",
-        "setuptools": "pkg_resources"
+        "setuptools": "pkg_resources",
     }
     pins = {
         "scikit-learn": "scikit-learn==1.4.0",
@@ -267,7 +581,7 @@ def install_deps():
         "pandas": "pandas==2.2.0",
         "matplotlib": "matplotlib==3.8.3",
         "seaborn": "seaborn==0.13.2",
-        "setuptools": "setuptools==69.0.0"
+        "setuptools": "setuptools==69.0.0",
     }
     missing = []
     for pkg_name, mod_name in mod_map.items():
@@ -277,243 +591,397 @@ def install_deps():
             missing.append(pins[pkg_name])
     if missing:
         try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"] + missing, check=True)
-        except Exception as e:
-            print(f"⚠️ Dependency notice: {e}")
-            print(f"👉 Please make sure the MetFlow environment is active: micromamba activate conf_sel_gen")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir"] + missing,
+                check=True,
+            )
+        except Exception as exc:
+            print(f"⚠️ Dependency notice: {exc}")
+            print("👉 Please make sure the MetFlow environment is active: micromamba activate conf_sel_gen")
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/models.py"
+"""Core dataclasses for the MET Flow pipeline."""
 
-install_deps()
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-import argparse
-import numpy as np
-import pandas as pd
-import MDAnalysis as mda
-import matplotlib.pyplot as plt
-import seaborn as sns
+
+@dataclass
+class PipelineConfig:
+    """Configuration for all 27 CLI flags and runtime options."""
+
+    skim: str = "false"
+    equator: str = ""
+    top: str = ""
+    bottom: str = ""
+    min_vol: float = 300.0
+    cluster: str = "pca_kmeans"
+    k: int = 8
+    rmsd: float = 2.0
+    cnn_eps: float = 3.0
+    allostery: str = "false"
+    cavity_res: str = ""
+    loop_res: str = ""
+    pca_res: str = ""
+    advanced_plots: str = "false"
+    gen_params: str = ""
+    dataset_configs: str = ""
+    pdb: str = ""
+    xtc: str = ""
+    multi_datasets: str = "false"
+    dataset_labels: str = ""
+    out_dir: str = "clustering_results"
+    calc_energy: str = "false"
+    only_energy: str = "false"
+    only_dashboard: str = "false"
+    max_frames: int = 0
+    min_steps: int = 100
+    pca_ref: str = "combined"
+    base_dir: str = "."
+
+    @property
+    def is_only_energy(self) -> bool:
+        return self.only_energy.lower() == "true"
+
+    @property
+    def is_only_dashboard(self) -> bool:
+        return self.only_dashboard.lower() == "true"
+
+    @property
+    def is_skim(self) -> bool:
+        return self.skim.lower() == "true"
+
+    @property
+    def is_allostery(self) -> bool:
+        return self.allostery.lower() == "true"
+
+    @property
+    def is_advanced_plots(self) -> bool:
+        return self.advanced_plots.lower() == "true"
+
+    @property
+    def is_calc_energy(self) -> bool:
+        return self.calc_energy.lower() == "true"
+
+
+@dataclass
+class StageResult:
+    """Standardized return object for every pipeline stage."""
+
+    stage_name: str
+    success: bool
+    exit_code: int = 0
+    artifacts: List[str] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+
+
+@dataclass
+class TrajectoryContext:
+    """Shared mutable state passed sequentially across pipeline stages."""
+
+    config: PipelineConfig
+    out_dir: str = ""
+    dataset_configs: List[Tuple[str, str, str]] = field(default_factory=list)
+    master_ref_pdb: str = ""
+    methodology: List[str] = field(default_factory=list)
+
+    # Stage 1 state
+    temp_universes: List[Any] = field(default_factory=list)
+    dataset_seqs: List[str] = field(default_factory=list)
+    dataset_matches: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    ds_residues_homologous: List[Any] = field(default_factory=list)
+    ds_consensus_groups: List[Any] = field(default_factory=list)
+    ds_consensus_indexers: List[Any] = field(default_factory=list)
+    u_consensus: Any = None
+    ref_consensus_mean: Any = None
+    merged_ref_path: str = ""
+    unified_ref_path: str = ""
+    pca_atom_indices: Any = None
+    ref_bb_atoms: Any = None
+    ref_bb: Any = None
+    universes: List[Any] = field(default_factory=list)
+    dataset_scales: List[float] = field(default_factory=list)
+    dataset_offsets: List[int] = field(default_factory=list)
+    dataset_tags: List[str] = field(default_factory=list)
+    frame_universe_map: List[Tuple[Any, int]] = field(default_factory=list)
+    n_frames_initial: int = 0
+    valid_frames: Any = None
+
+    # Stage 2 state
+    unique_tags: List[str] = field(default_factory=list)
+
+    # Stage 3 state
+    merged_xtc_path: str = ""
+    unified_xtc_path: str = ""
+    coords_array: Any = None
+    rmsd_to_ref: Any = None
+    X: Any = None
+    X_pca: Any = None
+    pca_model: Any = None
+    var_explained: Any = None
+    df_data: Dict[str, Any] = field(default_factory=dict)
+
+    # Stage 4 state
+    rmsd_matrix: Any = None
+
+    # Stage 5 state
+    energy_interrupted: bool = False
+
+    # Stage 6 state
+    df: Any = None
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage1_ingestion/__init__.py"
+"""Stage 1: Dataset ingestion, sequence alignment, and consensus indexing."""
+
+from metflow.stage1_ingestion.loader import run_stage1
+
+__all__ = ["run_stage1"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage1_ingestion/alignment.py"
+"""Sequence homology verification (>=90%) and consensus atom mapping."""
+
 from difflib import SequenceMatcher
-from MDAnalysis.analysis import align
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.metrics import silhouette_score, pairwise_distances
-from scipy.spatial import ConvexHull
-import datetime
-import warnings
-from multiprocessing import Pool
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-warnings.filterwarnings('ignore')
+from metflow.stage1_ingestion.indexing import (
+    canonical_atom_sort_key,
+    is_heavy_atom,
+)
 
-def _calc_vol(coords):
-    try: return ConvexHull(coords).volume
-    except Exception: return 0.0
 
-def batched_kabsch(P_raw, Q_ref, out=None, chunk_size=1024):
-    n_samples = len(P_raw)
-    if n_samples == 0:
-        return P_raw
-    if out is None:
-        out = np.empty_like(P_raw)
-    
-    # Process in chunks to avoid duplicate full-array memory allocations
-    for start in range(0, n_samples, chunk_size):
-        end = min(start + chunk_size, n_samples)
-        chunk = P_raw[start:end]
-        c_mean = chunk.mean(axis=1, keepdims=True)
-        c_centered = chunk - c_mean
-        H = np.matmul(c_centered.swapaxes(1, 2), Q_ref)
-        U, _, Vt = np.linalg.svd(H)
-        R = np.matmul(U, Vt)
-        dets = (R[:, 0, 0] * (R[:, 1, 1] * R[:, 2, 2] - R[:, 1, 2] * R[:, 2, 1])
-              - R[:, 0, 1] * (R[:, 1, 0] * R[:, 2, 2] - R[:, 1, 2] * R[:, 2, 0])
-              + R[:, 0, 2] * (R[:, 1, 0] * R[:, 2, 1] - R[:, 1, 1] * R[:, 2, 0]))
-        neg_mask = dets < 0
-        if np.any(neg_mask):
-            U[neg_mask, :, 2] *= -1
-            R[neg_mask] = np.matmul(U[neg_mask], Vt[neg_mask])
-        np.matmul(c_centered, R, out=out[start:end])
-    return out
+def compute_pairwise_identity(
+    s1: str, s2: str, matcher: Optional[SequenceMatcher] = None
+) -> float:
+    """Compute sequence identity as sum(matching_block.size) / max(len(s1), len(s2))."""
+    if s1 == s2:
+        return 1.0 if len(s1) > 0 else 0.0
+    max_len = max(len(s1), len(s2))
+    if max_len == 0:
+        return 0.0
+    m = matcher if matcher is not None else SequenceMatcher(None, "", "")
+    m.set_seqs(s1, s2)
+    identical_count = sum(b.size for b in m.get_matching_blocks())
+    return identical_count / max_len
 
-def parse_res_string(res_str):
-    res_list = []
-    for part in res_str.replace(',', ' ').split():
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            res_list.extend(range(start, end + 1))
+
+def verify_sequence_homology(
+    dataset_seqs: Sequence[str],
+    labels: Sequence[str],
+    threshold: float = 0.90,
+) -> Dict[Tuple[str, str], float]:
+    """Verify all dataset pairs meet the sequence identity threshold."""
+    pair_ident_cache: Dict[Tuple[str, str], float] = {}
+    matcher = SequenceMatcher(None, "", "")
+    for i in range(len(dataset_seqs)):
+        for j in range(i + 1, len(dataset_seqs)):
+            s1, s2 = dataset_seqs[i], dataset_seqs[j]
+            l1, l2 = labels[i], labels[j]
+            if (s1, s2) in pair_ident_cache:
+                identity = pair_ident_cache[(s1, s2)]
+            elif (s2, s1) in pair_ident_cache:
+                identity = pair_ident_cache[(s2, s1)]
+            else:
+                identity = compute_pairwise_identity(s1, s2, matcher=matcher)
+                pair_ident_cache[(s1, s2)] = identity
+                pair_ident_cache[(s2, s1)] = identity
+            if identity < threshold:
+                raise ValueError(
+                    f"Sequence similarity across datasets '{l1}' and '{l2}' is "
+                    f"{identity * 100:.1f}%, which is below the {threshold * 100:.1f}% threshold."
+                )
+    return pair_ident_cache
+
+
+def find_consensus_bounds(
+    resname_seqs: Sequence[Tuple[str, ...]],
+    labels: Sequence[str],
+    dataset_seqs: Sequence[str],
+    pair_ident_cache: Dict[Tuple[str, str], float],
+    min_consensus_len: int = 10,
+) -> Tuple[List[Tuple[int, int, int, int]], int, int, int, str]:
+    """Find longest contiguous homologous region across all datasets."""
+    ref_seq = resname_seqs[0]
+    ref_seq_len = len(ref_seq)
+    seq_match_cache: Dict[Tuple[str, ...], Tuple[int, int, int, int]] = {}
+    dataset_matches: List[Tuple[int, int, int, int]] = []
+    reusable_ref_matcher = SequenceMatcher(None, ref_seq, None)
+
+    for idx, ds_seq in enumerate(resname_seqs):
+        label = labels[idx]
+        if ds_seq == ref_seq:
+            match_tuple = (0, ref_seq_len, 0, ref_seq_len)
+        elif ds_seq in seq_match_cache:
+            match_tuple = seq_match_cache[ds_seq]
         else:
-            res_list.append(int(part))
-    return res_list
+            reusable_ref_matcher.set_seq2(ds_seq)
+            match = reusable_ref_matcher.find_longest_match(0, ref_seq_len, 0, len(ds_seq))
+            if match.size == 0:
+                raise ValueError(
+                    f"No matching residue sequence found between reference and dataset '{label}'!"
+                )
+            match_tuple = (match.a, match.a + match.size, match.b, match.b + match.size)
+            seq_match_cache[ds_seq] = match_tuple
+        dataset_matches.append(match_tuple)
 
-def parse_list_arg(arg_str):
-    if not arg_str:
-        return []
-    if ',' in arg_str:
-        return [x.strip() for x in arg_str.split(',') if x.strip()]
-    return [x.strip() for x in arg_str.split() if x.strip()]
+    seq_summary_lines = ["\n--- Multi-Source Sequence Verification Summary ---"]
+    for idx, label in enumerate(labels):
+        ds_s = dataset_seqs[idx]
+        ds_preview = (ds_s[:4] + "..." + ds_s[-4:]) if len(ds_s) > 10 else ds_s
+        if idx == 0:
+            seq_summary_lines.append(f"Dataset '{label}'       : {len(ds_s)} residues | Sequence {ds_preview}")
+        else:
+            ident_ref = pair_ident_cache.get(
+                (dataset_seqs[0], ds_s),
+                pair_ident_cache.get((ds_s, dataset_seqs[0]), 1.0),
+            )
+            ref_start, _, ds_start, _ = dataset_matches[idx]
+            offset = ref_start - ds_start
+            offset_str = f", N-terminal offset: {offset:+d}" if offset != 0 else ""
+            seq_summary_lines.append(
+                f"Dataset '{label}': {len(ds_s)} residues | Sequence {ds_preview} ({ident_ref * 100:.1f}% match{offset_str})"
+            )
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--skim", type=str, default="false")
-parser.add_argument("--equator", type=str, default="")
-parser.add_argument("--top", type=str, default="")
-parser.add_argument("--bottom", type=str, default="")
-parser.add_argument("--min_vol", type=float, default=300.0)
-parser.add_argument("--cluster", type=str, default="pca_kmeans")
-parser.add_argument("--k", type=int, default=8)
-parser.add_argument("--rmsd", type=float, default=2.0)
-parser.add_argument("--cnn_eps", type=float, default=3.0)
-parser.add_argument("--allostery", type=str, default="false")
-parser.add_argument("--cavity_res", type=str, default="")
-parser.add_argument("--loop_res", type=str, default="")
-parser.add_argument("--pca_res", type=str, default="")
-parser.add_argument("--advanced_plots", type=str, default="false")
-parser.add_argument("--gen_params", type=str, default="")
-parser.add_argument("--dataset_configs", type=str, default="")
-parser.add_argument("--pdb", type=str, default="")
-parser.add_argument("--xtc", type=str, default="")
-parser.add_argument("--multi_datasets", type=str, default="false")
-parser.add_argument("--dataset_labels", type=str, default="")
-parser.add_argument("--out_dir", type=str, default="clustering_results")
-parser.add_argument("--calc_energy", type=str, default="false")
-parser.add_argument("--only_energy", type=str, default="false")
-parser.add_argument("--only_dashboard", type=str, default="false")
-parser.add_argument("--max_frames", type=int, default=0)
-parser.add_argument("--min_steps", type=int, default=100)
-parser.add_argument("--pca_ref", type=str, default="combined")
-args = parser.parse_args()
+    consensus_ref_start = max(m[0] for m in dataset_matches)
+    consensus_ref_end = min(m[1] for m in dataset_matches)
+    consensus_len = consensus_ref_end - consensus_ref_start
 
-out_dir_abs = os.path.abspath(args.out_dir)
-base_dir_abs = os.path.abspath('.')
-try:
-    if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
-        print("Error: Directory traversal blocked")
-        sys.exit(1)
-except ValueError:
-    print("Error: Directory traversal blocked")
-    sys.exit(1)
-args.out_dir = out_dir_abs
+    if consensus_len < min_consensus_len:
+        raise ValueError(
+            f"Common homologous protein sequence length across datasets is {consensus_len} residues, "
+            f"which is below the minimum required {min_consensus_len} residues."
+        )
 
-if args.only_dashboard.lower() == "true":
-    out_dir = args.out_dir
-    os.makedirs(out_dir, exist_ok=True)
-    with open(__file__, "r", encoding="utf-8") as f:
-        content = f.read()
-    try:
-        start_marker = "<!DOC" + "TYPE html>"
-        end_marker = "</ht" + "ml>"
-        html = start_marker + content.split(start_marker)[1].split(end_marker)[0] + end_marker
-    except IndexError:
-        print("❌ Error: Could not find HTML block in script source.")
-        sys.exit(1)
-    csv_file = os.path.join(out_dir, "global_cluster_metrics.csv")
-    if os.path.exists(csv_file):
-        try:
-            import pandas as pd
-            df_dash = pd.read_csv(csv_file)
-            df_json = df_dash.to_json(orient="records")
-            html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
-        except Exception:
-            pass
-    dash_file = os.path.join(out_dir, "metflow_dashboard.html")
-    with open(dash_file, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"\n✅ Dashboard generated instantly at {dash_file}")
-    sys.exit(0)
+    return dataset_matches, consensus_ref_start, consensus_ref_end, consensus_len, "\n".join(seq_summary_lines)
 
-if args.only_energy.lower() == "true":
-    args.skim = "false"
-    args.allostery = "false"
-    args.cluster = "none"
-    args.calc_energy = "true"
 
-print("\n==================================================")
-print("   Initializing Post-Generation Analysis (v2.8 MULTI-SOURCE)")
-print("==================================================")
-print("--------------------------------------------------")
+def build_consensus_atom_groups(
+    temp_universes: List[Any],
+    dataset_matches: List[Tuple[int, int, int, int]],
+    consensus_ref_start: int,
+    consensus_len: int,
+) -> Tuple[List[Any], List[Any]]:
+    """Build 1-to-1 heavy-atom AtomGroups in canonical order across all datasets."""
+    import MDAnalysis as mda
 
-# Trajectory loading resolution logic
-if args.dataset_configs:
-    dataset_configs = []
-    for entry in args.dataset_configs.split(';'):
-        entry = entry.strip()
-        if not entry:
-            continue
-        parts = [p.strip() for p in entry.split(',')]
-        if len(parts) >= 2:
-            p_pdb = parts[0]
-            p_xtc = parts[1]
-            p_lbl = parts[2] if (len(parts) >= 3 and parts[2]) else os.path.splitext(os.path.basename(p_pdb))[0]
-            dataset_configs.append((p_pdb, p_xtc, p_lbl))
-elif args.multi_datasets.lower() == "true" or (len(parse_list_arg(args.pdb)) > 1 and len(parse_list_arg(args.xtc)) > 1):
-    pdb_list = parse_list_arg(args.pdb)
-    xtc_list = parse_list_arg(args.xtc)
-    label_list = parse_list_arg(args.dataset_labels)
-    
-    if len(pdb_list) != len(xtc_list):
-        print(f"Error: Number of PDB files ({len(pdb_list)}) does not match XTC files ({len(xtc_list)}).")
-        sys.exit(1)
-        
-    while len(label_list) < len(pdb_list):
-        curr_pdb = pdb_list[len(label_list)]
-        default_lbl = os.path.splitext(os.path.basename(curr_pdb))[0] or f"Dataset_{len(label_list) + 1}"
-        label_list.append(default_lbl)
-        
-    dataset_configs = list(zip(pdb_list, xtc_list, label_list))
-else:
-    if args.pdb or args.xtc:
-        pdb_path = parse_list_arg(args.pdb)[0] if parse_list_arg(args.pdb) else "./bioemu_ensemble/topology.pdb"
-        xtc_path = parse_list_arg(args.xtc)[0] if parse_list_arg(args.xtc) else "./bioemu_ensemble/samples.xtc"
-        if not os.path.exists(pdb_path) and os.path.exists("topology.pdb"):
-            pdb_path = "topology.pdb"
-        if not os.path.exists(xtc_path) and os.path.exists("samples.xtc"):
-            xtc_path = "samples.xtc"
-    else:
-        xtc_path = "./bioemu_ensemble/samples.xtc"
-        pdb_path = "./bioemu_ensemble/topology.pdb"
-        if not os.path.exists(xtc_path) and os.path.exists("samples.xtc"):
-            xtc_path = "samples.xtc"
-            pdb_path = "topology.pdb"
-    default_single_lbl = os.path.splitext(os.path.basename(pdb_path))[0] if pdb_path else "BioEmu_Ensemble"
-    if default_single_lbl in ["topology", ""]:
-        default_single_lbl = "BioEmu_Ensemble"
-    ds_label = parse_list_arg(args.dataset_labels)[0] if parse_list_arg(args.dataset_labels) else default_single_lbl
-    dataset_configs = [(pdb_path, xtc_path, ds_label)]
+    ds_residues_homologous = []
+    for idx, (_, _, label, _, _, prot_res) in enumerate(temp_universes):
+        ref_start, _, ds_start, _ = dataset_matches[idx]
+        ds_offset_start = ds_start + (consensus_ref_start - ref_start)
+        ds_slice = prot_res[ds_offset_start:ds_offset_start + consensus_len]
+        if len(ds_slice) != consensus_len:
+            raise ValueError(
+                f"Dataset '{label}' homologous residue slice length ({len(ds_slice)}) "
+                f"does not match expected consensus length ({consensus_len}). Boundary offset: {ds_offset_start}."
+            )
+        ds_residues_homologous.append(ds_slice)
 
-master_ref_pdb = dataset_configs[0][0]
-if not os.path.exists(master_ref_pdb):
-    print(f"Error: Could not find master reference topology PDB: {master_ref_pdb}")
-    sys.exit(1)
+    ds_consensus_atom_lists: List[List[Any]] = [[] for _ in range(len(temp_universes))]
+    for r in range(consensus_len):
+        res_atoms_per_ds = []
+        for idx in range(len(temp_universes)):
+            res_r = ds_residues_homologous[idx][r]
+            heavy_atoms = [a for a in res_r.atoms if is_heavy_atom(a)]
+            name_to_atom = {}
+            for a in heavy_atoms:
+                aname = a.name.strip().upper()
+                if aname not in name_to_atom:
+                    name_to_atom[aname] = a
+            res_atoms_per_ds.append(name_to_atom)
 
-u_master = mda.Universe(master_ref_pdb)
-out_dir = args.out_dir
-os.makedirs(out_dir, exist_ok=True)
+        common_names = set(res_atoms_per_ds[0].keys())
+        for idx in range(1, len(temp_universes)):
+            common_names &= set(res_atoms_per_ds[idx].keys())
 
-# Save run parameters to out_dir/metflow_params.txt and working directory metflow_params.txt
-param_str = "\n".join(f"{arg_k}={arg_v}" for arg_k, arg_v in vars(args).items()) + "\n"
-with open(os.path.join(out_dir, "metflow_params.txt"), "w", encoding="utf-8") as f_param:
-    f_param.write(param_str)
-if out_dir != base_dir_abs:
-    try:
-        with open("metflow_params.txt", "w", encoding="utf-8") as f_param2:
-            f_param2.write(param_str)
-    except Exception:
-        pass
+        sorted_names = sorted(common_names, key=canonical_atom_sort_key)
+        for idx in range(len(temp_universes)):
+            for aname in sorted_names:
+                ds_consensus_atom_lists[idx].append(res_atoms_per_ds[idx][aname])
 
-methodology = [f"=== MET Pipeline Methodology ===\nDate: {datetime.datetime.now()}"]
-if args.gen_params:
-    methodology.append(f"Generation Parameters:\n{args.gen_params}")
+    ds_consensus_groups = [mda.AtomGroup(alist) for alist in ds_consensus_atom_lists]
+    return ds_residues_homologous, ds_consensus_groups
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage1_ingestion/indexing.py"
+"""Residue/atom constants, canonical ordering, and coordinate indexing helpers."""
+
+from typing import Any
+import numpy as np
 
 PROTEIN_RESNAMES = {
-    'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
-    'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL',
-    'HIE', 'HID', 'HIP', 'HSD', 'HSE', 'HSP', 'CYX', 'CYM', 'MSE'
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "HIE", "HID", "HIP", "HSD", "HSE", "HSP", "CYX", "CYM", "MSE",
 }
 
-def extract_ca_atoms(u_obj):
-    if hasattr(u_obj, 'select_atoms'):
+RESNAME_MAP = {
+    "HIE": "HIS", "HID": "HIS", "HIP": "HIS", "HSD": "HIS", "HSE": "HIS", "HSP": "HIS",
+    "CYX": "CYS", "CYM": "CYS", "MSE": "MET",
+}
+
+AA_3TO1 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
+
+CANONICAL_ATOM_ORDER = [
+    "N", "CA", "C", "O",
+    "CB", "CG", "CG1", "CG2", "OG", "OG1", "SG",
+    "CD", "CD1", "CD2", "ND1", "ND2", "OD1", "OD2", "SD",
+    "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2", "SE",
+    "CZ", "CZ2", "CZ3", "NZ", "CH2", "NH1", "NH2", "OH", "OXT",
+]
+ATOM_ORDER_INDEX = {name: idx for idx, name in enumerate(CANONICAL_ATOM_ORDER)}
+
+
+def normalize_resname(name: str) -> str:
+    """Normalize protonation/selenomethionine residue variants to canonical 3-letter code."""
+    n = name.upper()
+    return RESNAME_MAP.get(n, n)
+
+
+def res_to_1letter(resname: str) -> str:
+    """Convert 3-letter residue name to 1-letter code ('X' if unknown)."""
+    return AA_3TO1.get(normalize_resname(resname), "X")
+
+
+def canonical_atom_sort_key(atom_name: str):
+    """Sort key placing backbone atoms (N, CA, C, O, CB...) in canonical PDB order."""
+    clean = atom_name.strip().upper()
+    return (ATOM_ORDER_INDEX.get(clean, 999), clean)
+
+
+def is_heavy_atom(atom: Any) -> bool:
+    """Return True if atom is a canonical non-hydrogen heavy protein atom."""
+    aname = atom.name.strip().upper()
+    aname_no_digits = aname.lstrip("0123456789")
+    if aname_no_digits.startswith("H"):
+        return False
+    if hasattr(atom, "type") and str(atom.type).strip().upper() == "H":
+        return False
+    if hasattr(atom, "element") and str(atom.element).strip().upper() == "H":
+        return False
+    return aname in ATOM_ORDER_INDEX
+
+
+def extract_ca_atoms(u_obj: Any) -> Any:
+    """Extract one C-alpha (or fallback) atom per protein residue."""
+    import MDAnalysis as mda
+
+    if hasattr(u_obj, "select_atoms"):
         res_q = " ".join(PROTEIN_RESNAMES)
-        protein_atoms = u_obj.select_atoms(f"resname {res_q} and not (name H* or name [0-9]H* or type H or element H)")
-        target_residues = protein_atoms.residues if len(protein_atoms) > 0 else (u_obj.residues if hasattr(u_obj, 'residues') else [])
+        protein_atoms = u_obj.select_atoms(
+            f"resname {res_q} and not (name H* or name [0-9]H* or type H or element H)"
+        )
+        target_residues = (
+            protein_atoms.residues
+            if len(protein_atoms) > 0
+            else (u_obj.residues if hasattr(u_obj, "residues") else [])
+        )
     else:
-        target_residues = u_obj.residues if hasattr(u_obj, 'residues') else []
+        target_residues = u_obj.residues if hasattr(u_obj, "residues") else []
+
     ca_list = []
     for res in target_residues:
         ca_in_res = res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
@@ -523,21 +991,18 @@ def extract_ca_atoms(u_obj):
             ca_list.append(res.atoms[1])
         elif len(res.atoms) > 0:
             ca_list.append(res.atoms[0])
+
     if len(ca_list) > 0:
         return mda.AtomGroup(ca_list)
-    return u_obj.atoms if hasattr(u_obj, 'atoms') else u_obj
+    return u_obj.atoms if hasattr(u_obj, "atoms") else u_obj
 
-def precompute_atom_indexer(atom_group):
-    """
-    Pre-compute direct numpy slice or fancy indexing array from an AtomGroup.
-    Returns slice(start, end) if contiguous, or numpy index array if non-contiguous.
-    """
-    if hasattr(atom_group, 'indices'):
+
+def precompute_atom_indexer(atom_group: Any):
+    """Pre-compute direct numpy slice or fancy indexing array from an AtomGroup."""
+    if hasattr(atom_group, "indices"):
         indices = atom_group.indices
     elif isinstance(atom_group, slice):
         return atom_group
-    elif isinstance(atom_group, (np.ndarray, list, tuple)):
-        indices = np.asarray(atom_group)
     else:
         indices = np.asarray(atom_group)
 
@@ -547,7 +1012,9 @@ def precompute_atom_indexer(atom_group):
         return slice(int(indices[0]), int(indices[-1] + 1))
     return indices
 
-def extract_group_coords(u_ds, atom_group, out=None):
+
+def extract_group_coords(u_ds: Any, atom_group: Any, out: np.ndarray = None) -> np.ndarray:
+    """Extract (n_frames, n_atoms, 3) float32 coordinate array for an atom group."""
     n_frames = len(u_ds.trajectory)
     if isinstance(atom_group, slice):
         indexer = atom_group
@@ -561,202 +1028,109 @@ def extract_group_coords(u_ds, atom_group, out=None):
 
     if n_frames == 0 or n_atoms == 0:
         return np.empty((n_frames, n_atoms, 3), dtype=np.float32) if out is None else out
-    if out is None:
-        coords = np.empty((n_frames, n_atoms, 3), dtype=np.float32)
-    else:
-        coords = out
+    coords = np.empty((n_frames, n_atoms, 3), dtype=np.float32) if out is None else out
 
     for idx_f, ts in enumerate(u_ds.trajectory):
         coords[idx_f] = ts.positions[indexer]
     return coords
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage1_ingestion/loader.py"
+"""Stage 1 loader: dataset resolution, universe initialization, and consensus PDB export."""
 
-# Pre-validate PDB/XTC files, initialize universes, and filter non-protein atoms across datasets
-temp_universes = []
-prot_res_str = " ".join(PROTEIN_RESNAMES)
-for pdb_p, xtc_p, label in dataset_configs:
-    if not os.path.exists(pdb_p):
-        print(f"Error: PDB file not found: {pdb_p}")
-        sys.exit(1)
-    if not os.path.exists(xtc_p):
-        print(f"Error: XTC file not found: {xtc_p}")
-        sys.exit(1)
-    u_temp = mda.Universe(pdb_p, xtc_p)
-    # Whitelist standard and common modified protein residues; strip waters, ions, ligands, explicit hydrogens
-    protein_atoms = u_temp.select_atoms(f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)")
-    if len(protein_atoms) == 0:
-        raise ValueError(f"No protein residues matching PROTEIN_RESNAMES found in {pdb_p}.")
-    ca_group = extract_ca_atoms(protein_atoms)
-    prot_res = protein_atoms.residues
-    temp_universes.append((pdb_p, xtc_p, label, u_temp, ca_group, prot_res))
+import datetime
+import os
+import shutil
+from typing import List, Tuple
 
-is_only_energy = (args.only_energy.lower() == "true")
-if is_only_energy:
-    print("\n--- Option [C]: Fast Energy ONLY Calculation Mode (Consensus-Aligned) ---")
+import numpy as np
 
-# Determine common reference matching bounds across all datasets using fast sequence matching & caching
-RESNAME_MAP = {
-    'HIE': 'HIS', 'HID': 'HIS', 'HIP': 'HIS', 'HSD': 'HIS', 'HSE': 'HIS', 'HSP': 'HIS',
-    'CYX': 'CYS', 'CYM': 'CYS', 'MSE': 'MET'
-}
-def normalize_resname(name):
-    n = name.upper()
-    return RESNAME_MAP.get(n, n)
+from metflow.cli import parse_list_arg, parse_res_string, save_params
+from metflow.models import PipelineConfig, StageResult, TrajectoryContext
+from metflow.stage1_ingestion.alignment import (
+    build_consensus_atom_groups,
+    find_consensus_bounds,
+    verify_sequence_homology,
+)
+from metflow.stage1_ingestion.indexing import (
+    PROTEIN_RESNAMES,
+    extract_ca_atoms,
+    normalize_resname,
+    precompute_atom_indexer,
+    res_to_1letter,
+)
 
-AA_3TO1 = {
-    'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
-    'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
-    'LEU': 'L', 'LYS': 'K', 'MET': 'M', 'PHE': 'F', 'PRO': 'P',
-    'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
-}
-def res_to_1letter(resname):
-    norm = normalize_resname(resname)
-    return AA_3TO1.get(norm, 'X')
 
-dataset_seqs = []
-for _, _, label, _, _, prot_res in temp_universes:
-    s_d = "".join(res_to_1letter(rn) for rn in prot_res.resnames)
-    dataset_seqs.append(s_d)
+def resolve_dataset_configs(config: PipelineConfig) -> List[Tuple[str, str, str]]:
+    """Resolve CLI dataset arguments into a non-empty list of (pdb, xtc, label) tuples."""
+    if config.dataset_configs:
+        dataset_configs: List[Tuple[str, str, str]] = []
+        for entry in config.dataset_configs.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = [p.strip() for p in entry.split(",")]
+            if len(parts) >= 2:
+                p_pdb = parts[0]
+                p_xtc = parts[1]
+                p_lbl = (
+                    parts[2]
+                    if (len(parts) >= 3 and parts[2])
+                    else os.path.splitext(os.path.basename(p_pdb))[0]
+                )
+                dataset_configs.append((p_pdb, p_xtc, p_lbl))
+        if not dataset_configs:
+            raise ValueError(
+                "No valid dataset entries found in --dataset_configs. "
+                "Expected 'pdb1,xtc1,label1;pdb2,xtc2,label2'."
+            )
+        return dataset_configs
 
-pair_ident_cache = {}
-reusable_pair_matcher = SequenceMatcher(None, "", "")
-for i in range(len(dataset_seqs)):
-    for j in range(i + 1, len(dataset_seqs)):
-        s1, s2 = dataset_seqs[i], dataset_seqs[j]
-        l1, l2 = temp_universes[i][2], temp_universes[j][2]
-        if s1 == s2:
-            identity = 1.0
-        elif (s1, s2) in pair_ident_cache:
-            identity = pair_ident_cache[(s1, s2)]
-        elif (s2, s1) in pair_ident_cache:
-            identity = pair_ident_cache[(s2, s1)]
-        else:
-            max_len = max(len(s1), len(s2))
-            if max_len == 0:
-                identity = 0.0
-            else:
-                reusable_pair_matcher.set_seqs(s1, s2)
-                matching_blocks = reusable_pair_matcher.get_matching_blocks()
-                identical_count = sum(b.size for b in matching_blocks)
-                identity = identical_count / max_len
-            pair_ident_cache[(s1, s2)] = identity
-            pair_ident_cache[(s2, s1)] = identity
-        if identity < 0.90:
-            raise ValueError(f"Sequence similarity across datasets '{l1}' and '{l2}' is {identity*100:.1f}%, which is below the 90.0% threshold.")
+    pdb_list = parse_list_arg(config.pdb)
+    xtc_list = parse_list_arg(config.xtc)
+    if config.multi_datasets.lower() == "true" or (len(pdb_list) > 1 and len(xtc_list) > 1):
+        label_list = parse_list_arg(config.dataset_labels)
+        if len(pdb_list) != len(xtc_list):
+            raise ValueError(
+                f"Number of PDB files ({len(pdb_list)}) does not match XTC files ({len(xtc_list)})."
+            )
+        if len(pdb_list) == 0:
+            raise ValueError("Multi-dataset mode enabled but no PDB/XTC files were provided.")
+        while len(label_list) < len(pdb_list):
+            curr_pdb = pdb_list[len(label_list)]
+            default_lbl = os.path.splitext(os.path.basename(curr_pdb))[0] or f"Dataset_{len(label_list) + 1}"
+            label_list.append(default_lbl)
+        return list(zip(pdb_list, xtc_list, label_list))
 
-ref_prot_res = temp_universes[0][5]
-ref_seq = tuple(normalize_resname(rn) for rn in ref_prot_res.resnames)
-ref_seq_len = len(ref_seq)
-
-seq_match_cache = {}
-dataset_matches = []
-reusable_ref_matcher = SequenceMatcher(None, ref_seq, None)
-for _, _, label, _, _, prot_res in temp_universes:
-    ds_seq = tuple(normalize_resname(rn) for rn in prot_res.resnames)
-    if ds_seq == ref_seq:
-        match_tuple = (0, ref_seq_len, 0, ref_seq_len)
-    elif ds_seq in seq_match_cache:
-        match_tuple = seq_match_cache[ds_seq]
+    if config.pdb or config.xtc:
+        pdb_path = pdb_list[0] if pdb_list else "./bioemu_ensemble/topology.pdb"
+        xtc_path = xtc_list[0] if xtc_list else "./bioemu_ensemble/samples.xtc"
+        if not os.path.exists(pdb_path) and os.path.exists("topology.pdb"):
+            pdb_path = "topology.pdb"
+        if not os.path.exists(xtc_path) and os.path.exists("samples.xtc"):
+            xtc_path = "samples.xtc"
     else:
-        reusable_ref_matcher.set_seq2(ds_seq)
-        match = reusable_ref_matcher.find_longest_match(0, ref_seq_len, 0, len(ds_seq))
-        if match.size == 0:
-            raise ValueError(f"No matching residue sequence found between reference and dataset '{label}'!")
-        match_tuple = (match.a, match.a + match.size, match.b, match.b + match.size)
-        seq_match_cache[ds_seq] = match_tuple
-    dataset_matches.append(match_tuple)
+        xtc_path = "./bioemu_ensemble/samples.xtc"
+        pdb_path = "./bioemu_ensemble/topology.pdb"
+        if not os.path.exists(xtc_path) and os.path.exists("samples.xtc"):
+            xtc_path = "samples.xtc"
+            pdb_path = "topology.pdb"
 
-seq_summary_lines = ["\n--- Multi-Source Sequence Verification Summary ---"]
-for idx, (_, _, label, _, _, prot_res) in enumerate(temp_universes):
-    ds_s = dataset_seqs[idx]
-    ds_preview = (ds_s[:4] + "..." + ds_s[-4:]) if len(ds_s) > 10 else ds_s
-    if idx == 0:
-        seq_summary_lines.append(f"Dataset '{label}'       : {len(ds_s)} residues | Sequence {ds_preview}")
-    else:
-        ident_ref = pair_ident_cache.get((dataset_seqs[0], ds_s), pair_ident_cache.get((ds_s, dataset_seqs[0]), 1.0))
-        ref_start, _, ds_start, _ = dataset_matches[idx]
-        offset = ref_start - ds_start
-        offset_str = f", N-terminal offset: {offset:+d}" if offset != 0 else ""
-        seq_summary_lines.append(f"Dataset '{label}': {len(ds_s)} residues | Sequence {ds_preview} ({ident_ref*100:.1f}% match{offset_str})")
+    default_single_lbl = os.path.splitext(os.path.basename(pdb_path))[0] if pdb_path else "BioEmu_Ensemble"
+    if default_single_lbl in ["topology", ""]:
+        default_single_lbl = "BioEmu_Ensemble"
+    label_list = parse_list_arg(config.dataset_labels)
+    ds_label = label_list[0] if label_list else default_single_lbl
+    return [(pdb_path, xtc_path, ds_label)]
 
-seq_summary_text = "\n".join(seq_summary_lines)
-print(seq_summary_text)
-methodology.append(seq_summary_text)
 
-consensus_ref_start = max(m[0] for m in dataset_matches)
-consensus_ref_end = min(m[1] for m in dataset_matches)
-consensus_len = consensus_ref_end - consensus_ref_start
-
-if consensus_len < 10:
-    raise ValueError(f"Common homologous protein sequence length across datasets is {consensus_len} residues, which is below the minimum required 10 residues.")
-
-CANONICAL_ATOM_ORDER = [
-    'N', 'CA', 'C', 'O',
-    'CB', 'CG', 'CG1', 'CG2', 'OG', 'OG1', 'SG',
-    'CD', 'CD1', 'CD2', 'ND1', 'ND2', 'OD1', 'OD2', 'SD',
-    'CE', 'CE1', 'CE2', 'CE3', 'NE', 'NE1', 'NE2', 'OE1', 'OE2', 'SE',
-    'CZ', 'CZ2', 'CZ3', 'NZ', 'CH2', 'NH1', 'NH2', 'OH', 'OXT'
-]
-ATOM_ORDER_INDEX = {name: idx for idx, name in enumerate(CANONICAL_ATOM_ORDER)}
-
-def canonical_atom_sort_key(atom_name):
-    clean = atom_name.strip().upper()
-    return (ATOM_ORDER_INDEX.get(clean, 999), clean)
-
-def is_heavy_atom(a):
-    aname = a.name.strip().upper()
-    aname_no_digits = aname.lstrip('0123456789')
-    if aname_no_digits.startswith('H'):
-        return False
-    if hasattr(a, 'type') and a.type.strip().upper() == 'H':
-        return False
-    if hasattr(a, 'element') and a.element.strip().upper() == 'H':
-        return False
-    return aname in ATOM_ORDER_INDEX
-
-ds_residues_homologous = []
-for idx, (_, _, _, _, _, prot_res) in enumerate(temp_universes):
-    ref_start, _, ds_start, _ = dataset_matches[idx]
-    ds_offset_start = ds_start + (consensus_ref_start - ref_start)
-    ds_slice = prot_res[ds_offset_start : ds_offset_start + consensus_len]
-    if len(ds_slice) != consensus_len:
-        raise ValueError(
-            f"Dataset '{temp_universes[idx][2]}' homologous residue slice length ({len(ds_slice)}) "
-            f"does not match expected consensus length ({consensus_len}). Boundary offset: {ds_offset_start}."
-        )
-    ds_residues_homologous.append(ds_slice)
-
-ds_consensus_atom_lists = [[] for _ in range(len(temp_universes))]
-
-for r in range(consensus_len):
-    res_atoms_per_ds = []
-    for idx in range(len(temp_universes)):
-        res_r = ds_residues_homologous[idx][r]
-        heavy_atoms = [a for a in res_r.atoms if is_heavy_atom(a)]
-        name_to_atom = {}
-        for a in heavy_atoms:
-            aname = a.name.strip().upper()
-            if aname not in name_to_atom:
-                name_to_atom[aname] = a
-        res_atoms_per_ds.append(name_to_atom)
-    
-    common_names = set(res_atoms_per_ds[0].keys())
-    for idx in range(1, len(temp_universes)):
-        common_names &= set(res_atoms_per_ds[idx].keys())
-    
-    sorted_names = sorted(common_names, key=canonical_atom_sort_key)
-    
-    for idx in range(len(temp_universes)):
-        for aname in sorted_names:
-            ds_consensus_atom_lists[idx].append(res_atoms_per_ds[idx][aname])
-
-ds_consensus_groups = [mda.AtomGroup(alist) for alist in ds_consensus_atom_lists]
-
-def make_alias(src, dst):
+def make_alias(src: str, dst: str, out_dir: str) -> None:
+    """Create a symlink (or copy fallback) inside out_dir."""
     dst_abs = os.path.abspath(dst)
+    out_dir_abs = os.path.abspath(out_dir)
     if os.path.abspath(src) == dst_abs:
         return
     try:
-        if os.path.commonpath([out_dir, dst_abs]) != out_dir:
+        if os.path.commonpath([out_dir_abs, dst_abs]) != out_dir_abs:
             return
     except ValueError:
         return
@@ -768,363 +1142,517 @@ def make_alias(src, dst):
     try:
         os.symlink(os.path.basename(src), dst)
     except Exception:
-        import shutil
         shutil.copyfile(src, dst)
 
-ref_atoms = ds_consensus_groups[0]
-u_consensus = mda.Merge(ref_atoms)
 
-for i, res in enumerate(u_consensus.residues, start=1):
-    res.resid = i
-for i, atom in enumerate(u_consensus.atoms, start=1):
-    atom.id = i
+def run_stage1(ctx: TrajectoryContext) -> StageResult:
+    """Execute Stage 1: dataset loading, homology verification, and consensus reference export."""
+    import MDAnalysis as mda
 
-ref_consensus_pos = ref_atoms.positions.copy()
-ref_consensus_mean = ref_consensus_pos - ref_consensus_pos.mean(axis=0)
+    config = ctx.config
+    dataset_configs = resolve_dataset_configs(config)
+    if not dataset_configs:
+        raise ValueError("No datasets configured for analysis.")
 
-ref_rg = float(np.mean(np.sqrt(np.sum(ref_consensus_mean**2, axis=1))))
-if 0 < ref_rg < 5.0:
-    print(f"  -> Auto-detected nanometer (nm) coordinate scale for reference (Rg={ref_rg:.2f} nm). Auto-scaling reference to Ångströms (x10)...")
-    ref_consensus_mean *= 10.0
-    ref_rg *= 10.0
+    ctx.dataset_configs = dataset_configs
+    ctx.master_ref_pdb = dataset_configs[0][0]
+    if not os.path.exists(ctx.master_ref_pdb):
+        raise FileNotFoundError(f"Could not find master reference topology PDB: {ctx.master_ref_pdb}")
 
-u_consensus.atoms.positions = ref_consensus_mean
+    out_dir = config.out_dir
+    ctx.out_dir = out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    param_path = save_params(config, out_dir, base_dir=config.base_dir)
 
-merged_ref_path = os.path.join(out_dir, "merged_reference.pdb")
-unified_ref_path = os.path.join(out_dir, "unified_reference.pdb")
-u_consensus.atoms.write(merged_ref_path)
-print(f"  -> Exported consensus reference PDB to {merged_ref_path}")
-make_alias(merged_ref_path, unified_ref_path)
-print(f"  -> Created unified reference alias at {unified_ref_path}")
+    ctx.methodology = [f"=== MET Pipeline Methodology ===\nDate: {datetime.datetime.now()}"]
+    if config.gen_params:
+        ctx.methodology.append(f"Generation Parameters:\n{config.gen_params}")
 
-ca_mask = np.array([a.name.strip().upper() == 'CA' for a in u_consensus.atoms])
-ca_indices = np.where(ca_mask)[0]
+    temp_universes = []
+    prot_res_str = " ".join(PROTEIN_RESNAMES)
+    for pdb_p, xtc_p, label in dataset_configs:
+        if not os.path.exists(pdb_p):
+            raise FileNotFoundError(f"PDB file not found: {pdb_p}")
+        if not os.path.exists(xtc_p):
+            raise FileNotFoundError(f"XTC file not found: {xtc_p}")
+        u_temp = mda.Universe(pdb_p, xtc_p)
+        protein_atoms = u_temp.select_atoms(
+            f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
+        )
+        if len(protein_atoms) == 0:
+            raise ValueError(f"No protein residues matching PROTEIN_RESNAMES found in {pdb_p}.")
+        ca_group = extract_ca_atoms(protein_atoms)
+        prot_res = protein_atoms.residues
+        temp_universes.append((pdb_p, xtc_p, label, u_temp, ca_group, prot_res))
 
-if args.pca_res:
-    pca_res_list = set(parse_res_string(args.pca_res))
-    rel_indices = [
-        i for i in range(len(ca_indices))
-        if (i + 1) in pca_res_list or u_consensus.residues[i].resid in pca_res_list
-    ]
-    if not rel_indices:
-        rel_indices = list(range(min(len(pca_res_list), len(ca_indices))))
-    pca_atom_indices = ca_indices[rel_indices]
-    methodology.append(f"Alignment and Global PCA restricted to {len(rel_indices)} C-alpha residues from: {args.pca_res}")
-else:
-    rel_indices = list(range(len(ca_indices)))
-    pca_atom_indices = ca_indices
-    methodology.append(f"Alignment and Global PCA used {len(ca_indices)} common C-alpha backbone atoms.")
+    ctx.temp_universes = temp_universes
+    if config.is_only_energy:
+        print("\n--- Option [C]: Fast Energy ONLY Calculation Mode (Consensus-Aligned) ---")
 
-ref_bb_atoms = u_consensus.atoms[pca_atom_indices]
-ref_bb = ref_consensus_mean[pca_atom_indices]
+    labels = [t[2] for t in temp_universes]
+    dataset_seqs = ["".join(res_to_1letter(rn) for rn in t[5].resnames) for t in temp_universes]
+    resname_seqs = [tuple(normalize_resname(rn) for rn in t[5].resnames) for t in temp_universes]
+    ctx.dataset_seqs = dataset_seqs
 
-offset_info = []
-for idx, (pdb_p, xtc_p, label, _, _, _) in enumerate(temp_universes):
-    ref_start, _, ds_start, _ = dataset_matches[idx]
-    offset = ref_start - ds_start
-    if offset != 0:
-        offset_info.append(f"{label} offset {offset:+} detected and aligned")
+    pair_ident_cache = verify_sequence_homology(dataset_seqs, labels, threshold=0.90)
+    dataset_matches, consensus_ref_start, _, consensus_len, seq_summary_text = find_consensus_bounds(
+        resname_seqs, labels, dataset_seqs, pair_ident_cache, min_consensus_len=10
+    )
+    ctx.dataset_matches = dataset_matches
+    print(seq_summary_text)
+    ctx.methodology.append(seq_summary_text)
 
-offset_str = f" ({', '.join(offset_info)})" if offset_info else ""
-print(f"Aligning frames across {len(dataset_configs)} dataset(s) in memory...")
-print(f"  -> Dynamic sequence alignment matched {consensus_len} residues ({len(u_consensus.atoms)} heavy atoms) across datasets{offset_str}.")
+    ds_residues_homologous, ds_consensus_groups = build_consensus_atom_groups(
+        temp_universes, dataset_matches, consensus_ref_start, consensus_len
+    )
+    ctx.ds_residues_homologous = ds_residues_homologous
+    ctx.ds_consensus_groups = ds_consensus_groups
 
-total_frames = sum(len(u_ds.trajectory) for _, _, _, u_ds, _, _ in temp_universes)
-n_consensus_atoms = len(u_consensus.atoms)
-dataset_tags = []
-frame_universe_map = []
-universes = []
-dataset_scales = []
-dataset_offsets = []
+    ref_atoms = ds_consensus_groups[0]
+    u_consensus = mda.Merge(ref_atoms)
+    for i, res in enumerate(u_consensus.residues, start=1):
+        res.resid = i
+    for i, atom in enumerate(u_consensus.atoms, start=1):
+        atom.id = i
 
-print(f"\n--- Loading and Aligning {len(dataset_configs)} Trajectory Dataset(s) ---")
-curr_frame_offset = 0
+    ref_consensus_pos = ref_atoms.positions.copy()
+    ref_consensus_mean = ref_consensus_pos - ref_consensus_pos.mean(axis=0)
+    ref_rg = float(np.mean(np.sqrt(np.sum(ref_consensus_mean ** 2, axis=1))))
+    if 0 < ref_rg < 5.0:
+        print(
+            f"  -> Auto-detected nanometer (nm) coordinate scale for reference (Rg={ref_rg:.2f} nm). "
+            "Auto-scaling reference to Ångströms (x10)..."
+        )
+        ref_consensus_mean *= 10.0
 
-ds_consensus_indexers = [precompute_atom_indexer(ag) for ag in ds_consensus_groups]
+    u_consensus.atoms.positions = ref_consensus_mean
+    ctx.u_consensus = u_consensus
+    ctx.ref_consensus_mean = ref_consensus_mean
 
-for idx, (pdb_p, xtc_p, label, u_ds, ca_g, prot_res) in enumerate(temp_universes):
-    print(f"Loading dataset '{label}' (PDB: {pdb_p}, XTC: {xtc_p})...")
-    universes.append(u_ds)
-    n_ds_frames = len(u_ds.trajectory)
-    dataset_offsets.append(curr_frame_offset)
-    
-    # Fast scale detection using first frame
-    if n_ds_frames > 0:
-        pos0 = u_ds.trajectory[0].positions[ds_consensus_indexers[idx]]
-        ca_centered = pos0 - pos0.mean(axis=0)
-        ds_rg = float(np.mean(np.sqrt(np.sum(ca_centered**2, axis=1))))
-        
-        if 0 < ds_rg < 5.0:
-            print(f"  -> Auto-detected nanometer (nm) coordinate scale for dataset '{label}' (Rg={ds_rg:.2f} nm). Auto-scaling to Ångströms (x10)...")
-            dataset_scales.append(10.0)
-        else:
-            dataset_scales.append(1.0)
+    merged_ref_path = os.path.join(out_dir, "merged_reference.pdb")
+    unified_ref_path = os.path.join(out_dir, "unified_reference.pdb")
+    u_consensus.atoms.write(merged_ref_path)
+    print(f"  -> Exported consensus reference PDB to {merged_ref_path}")
+    make_alias(merged_ref_path, unified_ref_path, out_dir)
+    print(f"  -> Created unified reference alias at {unified_ref_path}")
+    ctx.merged_ref_path = merged_ref_path
+    ctx.unified_ref_path = unified_ref_path
+
+    ca_mask = np.array([a.name.strip().upper() == "CA" for a in u_consensus.atoms])
+    ca_indices = np.where(ca_mask)[0]
+    if config.pca_res:
+        pca_res_list = set(parse_res_string(config.pca_res))
+        rel_indices = [
+            i
+            for i in range(len(ca_indices))
+            if (i + 1) in pca_res_list or u_consensus.residues[i].resid in pca_res_list
+        ]
+        if not rel_indices:
+            rel_indices = list(range(min(len(pca_res_list), len(ca_indices))))
+        pca_atom_indices = ca_indices[rel_indices]
+        ctx.methodology.append(
+            f"Alignment and Global PCA restricted to {len(rel_indices)} C-alpha residues from: {config.pca_res}"
+        )
     else:
-        dataset_scales.append(1.0)
-        
-    dataset_tags.extend([label] * n_ds_frames)
-    for local_idx in range(n_ds_frames):
-        frame_universe_map.append((u_ds, local_idx))
-    curr_frame_offset += n_ds_frames
+        pca_atom_indices = ca_indices
+        ctx.methodology.append(f"Alignment and Global PCA used {len(ca_indices)} common C-alpha backbone atoms.")
 
-dataset_offsets.append(curr_frame_offset)
+    ctx.pca_atom_indices = pca_atom_indices
+    ctx.ref_bb_atoms = u_consensus.atoms[pca_atom_indices]
+    ctx.ref_bb = ref_consensus_mean[pca_atom_indices]
 
-n_frames_initial = total_frames
-print(f"Loaded {n_frames_initial} total conformations across {len(dataset_configs)} dataset(s).")
-methodology.append(f"Loaded {len(dataset_configs)} dataset(s). Total conformations: {n_frames_initial}")
+    offset_info = []
+    for idx, (_, _, label, _, _, _) in enumerate(temp_universes):
+        ref_start, _, ds_start, _ = dataset_matches[idx]
+        offset = ref_start - ds_start
+        if offset != 0:
+            offset_info.append(f"{label} offset {offset:+} detected and aligned")
 
-valid_frames = np.arange(n_frames_initial)
+    offset_str = f" ({', '.join(offset_info)})" if offset_info else ""
+    print(f"Aligning frames across {len(dataset_configs)} dataset(s) in memory...")
+    print(
+        f"  -> Dynamic sequence alignment matched {consensus_len} residues "
+        f"({len(u_consensus.atoms)} heavy atoms) across datasets{offset_str}."
+    )
 
-# --- SKIMMING MODULE ---
-if args.skim.lower() == "true" and args.equator and args.top and args.bottom:
-    eq_res = [int(x) for x in args.equator.replace(',', ' ').split()]
-    top_res, bot_res = int(args.top.replace(',', '')), int(args.bottom.replace(',', ''))
+    total_frames = sum(len(t[3].trajectory) for t in temp_universes)
+    ctx.ds_consensus_indexers = [precompute_atom_indexer(ag) for ag in ds_consensus_groups]
+    ctx.universes = []
+    ctx.dataset_scales = []
+    ctx.dataset_offsets = []
+    ctx.dataset_tags = []
+    ctx.frame_universe_map = []
+
+    print(f"\n--- Loading and Aligning {len(dataset_configs)} Trajectory Dataset(s) ---")
+    curr_frame_offset = 0
+    for idx, (pdb_p, xtc_p, label, u_ds, _, _) in enumerate(temp_universes):
+        print(f"Loading dataset '{label}' (PDB: {pdb_p}, XTC: {xtc_p})...")
+        ctx.universes.append(u_ds)
+        n_ds_frames = len(u_ds.trajectory)
+        ctx.dataset_offsets.append(curr_frame_offset)
+
+        if n_ds_frames > 0:
+            pos0 = u_ds.trajectory[0].positions[ctx.ds_consensus_indexers[idx]]
+            ca_centered = pos0 - pos0.mean(axis=0)
+            ds_rg = float(np.mean(np.sqrt(np.sum(ca_centered ** 2, axis=1))))
+            if 0 < ds_rg < 5.0:
+                print(
+                    f"  -> Auto-detected nanometer (nm) coordinate scale for dataset '{label}' "
+                    f"(Rg={ds_rg:.2f} nm). Auto-scaling to Ångströms (x10)..."
+                )
+                ctx.dataset_scales.append(10.0)
+            else:
+                ctx.dataset_scales.append(1.0)
+        else:
+            ctx.dataset_scales.append(1.0)
+
+        ctx.dataset_tags.extend([label] * n_ds_frames)
+        for local_idx in range(n_ds_frames):
+            ctx.frame_universe_map.append((u_ds, local_idx))
+        curr_frame_offset += n_ds_frames
+
+    ctx.dataset_offsets.append(curr_frame_offset)
+    ctx.n_frames_initial = total_frames
+    ctx.valid_frames = np.arange(total_frames)
+    print(f"Loaded {total_frames} total conformations across {len(dataset_configs)} dataset(s).")
+    ctx.methodology.append(f"Loaded {len(dataset_configs)} dataset(s). Total conformations: {total_frames}")
+
+    return StageResult(
+        stage_name="stage1_ingestion",
+        success=True,
+        exit_code=0,
+        artifacts=[param_path, merged_ref_path, unified_ref_path],
+        metrics={
+            "n_datasets": len(dataset_configs),
+            "consensus_len": consensus_len,
+            "n_consensus_atoms": len(u_consensus.atoms),
+            "n_frames_initial": total_frames,
+        },
+    )
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage2_skimming/__init__.py"
+"""Stage 2: Conformational skimming and per-dataset downsampling."""
+
+from metflow.stage2_skimming.skimmer import run_stage2
+
+__all__ = ["run_stage2"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage2_skimming/sampling.py"
+"""Per-dataset uniform strided downsampling."""
+
+from typing import List, Tuple
+import numpy as np
+
+
+def downsample_per_dataset(
+    valid_frames: np.ndarray,
+    dataset_tags: List[str],
+    max_frames: int,
+) -> Tuple[np.ndarray, List[str], str]:
+    """Uniformly sample up to max_frames per dataset, preserving order."""
+    unique_tags = list(dict.fromkeys(dataset_tags))
+    if max_frames > 0:
+        dataset_tags_arr = np.array(dataset_tags)[valid_frames]
+        sampled_parts = []
+        for t in unique_tags:
+            t_idxs = valid_frames[dataset_tags_arr == t]
+            if len(t_idxs) > max_frames:
+                st = max(1, len(t_idxs) // max_frames)
+                sampled_parts.append(t_idxs[::st][:max_frames])
+            else:
+                sampled_parts.append(t_idxs)
+        sampled_frames = np.sort(np.concatenate(sampled_parts)) if sampled_parts else np.array([], dtype=int)
+        msg = (
+            f"Per-dataset sampling: up to {max_frames} frames per dataset "
+            f"({len(sampled_frames)} total)."
+        )
+        print(
+            f"\n[Per-Dataset Sampling] Uniformly sampled up to {max_frames} frames per dataset "
+            f"({len(sampled_frames)} total frames across {len(unique_tags)} dataset(s))."
+        )
+    else:
+        sampled_frames = valid_frames
+        msg = f"No downsampling applied: 100% of frames retained ({len(sampled_frames)} total)."
+        print(
+            f"\n[No Downsampling] Preserved 100% of frames ({len(sampled_frames)} total frames "
+            f"across {len(unique_tags)} dataset(s))."
+        )
+
+    filtered_tags = [dataset_tags[i] for i in sampled_frames]
+    return sampled_frames, filtered_tags, msg
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage2_skimming/skimmer.py"
+"""ConvexHull volume skimming, gate distance filtering, and PyMOL hull visualization."""
+
+from multiprocessing import Pool
+import os
+from typing import List, Optional, Tuple
+import numpy as np
+from scipy.spatial import ConvexHull
+
+from metflow.models import StageResult, TrajectoryContext
+from metflow.stage1_ingestion.indexing import extract_group_coords, precompute_atom_indexer
+from metflow.stage2_skimming.sampling import downsample_per_dataset
+
+
+def _calc_vol(coords: np.ndarray) -> float:
+    """Compute ConvexHull volume for a single frame's coordinates (0.0 on degenerate hull)."""
+    try:
+        return float(ConvexHull(coords).volume)
+    except Exception:
+        return 0.0
+
+
+def compute_hull_volumes(skim_coords_all: np.ndarray, use_multiprocessing: bool = True) -> np.ndarray:
+    """Compute ConvexHull volumes across frames with Windows-safe multiprocessing fallback."""
+    if len(skim_coords_all) == 0:
+        return np.array([], dtype=np.float64)
+    if use_multiprocessing and len(skim_coords_all) >= 64:
+        try:
+            with Pool() as p:
+                return np.array(p.map(_calc_vol, skim_coords_all), dtype=np.float64)
+        except Exception:
+            pass
+    return np.array([_calc_vol(c) for c in skim_coords_all], dtype=np.float64)
+
+
+def write_visualize_hull_py(
+    out_dir: str,
+    verts: np.ndarray,
+    top_res: int,
+    bot_res: int,
+) -> str:
+    """Write a PyMOL CGO visualization script for the convex hull and gate distance."""
+    hull = ConvexHull(verts)
+    cgo = ["from pymol.cgo import *", "from pymol import cmd", "obj = []"]
+    for s in hull.simplices:
+        v1, v2, v3 = verts[s[0]], verts[s[1]], verts[s[2]]
+        cgo.append(
+            f"obj.extend([BEGIN, TRIANGLES, COLOR, 0.4, 0.8, 0.8, "
+            f"VERTEX, {v1[0]:.3f}, {v1[1]:.3f}, {v1[2]:.3f}, "
+            f"VERTEX, {v2[0]:.3f}, {v2[1]:.3f}, {v2[2]:.3f}, "
+            f"VERTEX, {v3[0]:.3f}, {v3[1]:.3f}, {v3[2]:.3f}, END])"
+        )
+    cgo.extend([
+        "cmd.load_cgo(obj, 'internal_volume_mesh')",
+        "cmd.set('cgo_transparency', 0.4, 'internal_volume_mesh')",
+        f"cmd.distance('gate_distance', 'resid {top_res} and name CA', 'resid {bot_res} and name CA')",
+    ])
+    out_path = os.path.join(out_dir, "visualize_hull.py")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(cgo) + "\n")
+    return out_path
+
+
+def skim_frames(ctx: TrajectoryContext) -> Tuple[np.ndarray, Optional[str]]:
+    """Filter frames by ConvexHull volume > min_vol and gate distance > 8.0 A."""
+    import MDAnalysis as mda
+
+    config = ctx.config
+    if not (config.is_skim and config.equator and config.top and config.bottom):
+        print("Skipped skimming.")
+        ctx.methodology.append("\n--- Conformational Skimming ---\nNo skimming was applied.")
+        return ctx.valid_frames, None
+
+    eq_res = [int(x) for x in config.equator.replace(",", " ").split()]
+    top_res = int(config.top.replace(",", ""))
+    bot_res = int(config.bottom.replace(",", ""))
     all_skim_res = eq_res + [top_res, bot_res]
-    res_str = " ".join([str(x) for x in all_skim_res])
-    
-    print(f"\n--- Starting Tandem Skimming ---")
-    
+    res_str = " ".join(str(x) for x in all_skim_res)
+
+    print("\n--- Starting Tandem Skimming ---")
     skim_coords_list = []
-    top_coords_list = []
-    bot_coords_list = []
-    for idx, u_ds in enumerate(universes):
+    top_idx_in_s = len(eq_res)
+    bot_idx_in_s = len(eq_res) + 1
+
+    for idx, u_ds in enumerate(ctx.universes):
         s_atom_list = []
         for r_num in all_skim_res:
             r_idx = r_num - 1
-            if 0 <= r_idx < len(ds_residues_homologous[idx]):
-                target_res = ds_residues_homologous[idx][r_idx]
+            if 0 <= r_idx < len(ctx.ds_residues_homologous[idx]):
+                target_res = ctx.ds_residues_homologous[idx][r_idx]
                 ca_matches = target_res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
-                if len(ca_matches) > 0:
-                    s_atom_list.append(ca_matches[0])
-                else:
-                    s_atom_list.append(target_res.atoms[0])
+                s_atom_list.append(ca_matches[0] if len(ca_matches) > 0 else target_res.atoms[0])
             else:
                 fallback_atoms = u_ds.select_atoms(f"resid {r_num} and name CA")
                 if len(fallback_atoms) > 0:
                     s_atom_list.append(fallback_atoms[0])
                 else:
-                    print(f"Error: Residue {r_num} CA not found in dataset '{temp_universes[idx][2]}'. Aborting skim.")
-                    sys.exit(1)
+                    raise ValueError(
+                        f"Residue {r_num} CA not found in dataset '{ctx.temp_universes[idx][2]}'. Aborting skim."
+                    )
+
         s_atoms = mda.AtomGroup(s_atom_list)
-        top_idx_in_s = len(eq_res)
-        bot_idx_in_s = len(eq_res) + 1
-        
         s_coords = extract_group_coords(u_ds, precompute_atom_indexer(s_atoms))
-        if dataset_scales[idx] != 1.0:
-            s_coords *= dataset_scales[idx]
-        t_coords = s_coords[:, top_idx_in_s, :]
-        b_coords = s_coords[:, bot_idx_in_s, :]
-        
+        if ctx.dataset_scales[idx] != 1.0:
+            s_coords *= ctx.dataset_scales[idx]
         skim_coords_list.append(s_coords)
-        top_coords_list.append(t_coords)
-        bot_coords_list.append(b_coords)
-        
-    skim_coords_all = np.concatenate(skim_coords_list, axis=0)
-    top_coords_all = np.concatenate(top_coords_list, axis=0)
-    bot_coords_all = np.concatenate(bot_coords_list, axis=0)
-    heights = np.linalg.norm(top_coords_all - bot_coords_all, axis=1)
-    
+
+    skim_coords_all = (
+        skim_coords_list[0]
+        if len(skim_coords_list) == 1
+        else np.concatenate(skim_coords_list, axis=0)
+    )
+    heights = np.linalg.norm(
+        skim_coords_all[:, top_idx_in_s, :] - skim_coords_all[:, bot_idx_in_s, :], axis=1
+    )
+
     print("Computing volumes with multiprocessing...")
-    with Pool() as p:
-        vols = np.array(p.map(_calc_vol, skim_coords_all))
-        
-    passed_mask = (vols > args.min_vol) & (heights > 8.0)
-    passed_frames = np.where(passed_mask)[0].tolist()
-    valid_frames = np.array(passed_frames)
-    print(f"Skimming Complete: {len(valid_frames)} / {n_frames_initial} passed.")
-    methodology.append(f"Tandem skim (Volume > {args.min_vol}, Dist > 8.0). Surviving: {len(valid_frames)}")
-    
+    vols = compute_hull_volumes(skim_coords_all, use_multiprocessing=True)
+
+    passed_mask = (vols > config.min_vol) & (heights > 8.0)
+    valid_frames = np.where(passed_mask)[0]
+    print(f"Skimming Complete: {len(valid_frames)} / {ctx.n_frames_initial} passed.")
+    ctx.methodology.append(
+        f"Tandem skim (Volume > {config.min_vol}, Dist > 8.0). Surviving: {len(valid_frames)}"
+    )
+
+    hull_script: Optional[str] = None
     if len(valid_frames) > 0:
-        u_first, l_first = frame_universe_map[valid_frames[0]]
+        u_first, l_first = ctx.frame_universe_map[valid_frames[0]]
         u_first.trajectory[l_first]
         skim_atoms_first = u_first.select_atoms(f"resid {res_str} and name CA")
-        hull = ConvexHull(skim_atoms_first.positions)
-        verts = skim_atoms_first.positions
-        cgo = ["from pymol.cgo import *", "from pymol import cmd", "obj = []"]
-        for s in hull.simplices:
-            v1, v2, v3 = verts[s[0]], verts[s[1]], verts[s[2]]
-            cgo.append(f"obj.extend([BEGIN, TRIANGLES, COLOR, 0.4, 0.8, 0.8, VERTEX, {v1[0]:.3f}, {v1[1]:.3f}, {v1[2]:.3f}, VERTEX, {v2[0]:.3f}, {v2[1]:.3f}, {v2[2]:.3f}, VERTEX, {v3[0]:.3f}, {v3[1]:.3f}, {v3[2]:.3f}, END])")
-        cgo.extend(["cmd.load_cgo(obj, 'internal_volume_mesh')", "cmd.set('cgo_transparency', 0.4, 'internal_volume_mesh')"])
-        cgo.append(f"cmd.distance('gate_distance', 'resid {top_res} and name CA', 'resid {bot_res} and name CA')")
-        with open(f"{out_dir}/visualize_hull.py", "w") as f:
-            f.write("\n".join(cgo) + "\n")
-        print(f"Generated PyMOL visualization script: {out_dir}/visualize_hull.py")
-else:
-    print("Skipped skimming.")
-    methodology.append("\n--- Conformational Skimming ---\nNo skimming was applied.")
+        hull_script = write_visualize_hull_py(ctx.out_dir, skim_atoms_first.positions, top_res, bot_res)
+        print(f"Generated PyMOL visualization script: {hull_script}")
 
-if len(valid_frames) < 2:
-    print("Error: Too few valid frames remaining to perform clustering.")
-    sys.exit(1)
+    return valid_frames, hull_script
 
-unique_tags = list(dict.fromkeys(dataset_tags))
-if args.max_frames > 0:
-    dataset_tags_arr = np.array(dataset_tags)[valid_frames]
-    sampled_parts = []
-    for t in unique_tags:
-        t_idxs = valid_frames[dataset_tags_arr == t]
-        if len(t_idxs) > args.max_frames:
-            st = max(1, len(t_idxs) // args.max_frames)
-            sampled_parts.append(t_idxs[::st][:args.max_frames])
-        else:
-            sampled_parts.append(t_idxs)
-            
-    valid_frames = np.sort(np.concatenate(sampled_parts))
-    print(f"\n[Per-Dataset Sampling] Uniformly sampled up to {args.max_frames} frames per dataset ({len(valid_frames)} total frames across {len(unique_tags)} dataset(s)).")
-    methodology.append(f"Per-dataset sampling: up to {args.max_frames} frames per dataset ({len(valid_frames)} total).")
-else:
-    print(f"\n[No Downsampling] Preserved 100% of frames ({len(valid_frames)} total frames across {len(unique_tags)} dataset(s)).")
-    methodology.append(f"No downsampling applied: 100% of frames retained ({len(valid_frames)} total).")
 
-dataset_tags = [dataset_tags[i] for i in valid_frames]
+def run_stage2(ctx: TrajectoryContext) -> StageResult:
+    """Execute Stage 2: conformational skimming and per-dataset downsampling."""
+    artifacts: List[str] = []
+    valid_frames, hull_script = skim_frames(ctx)
+    if hull_script:
+        artifacts.append(hull_script)
 
-# --- Physical Unified Trajectory Export & Streaming Alignment ---
-merged_xtc_path = os.path.join(out_dir, "merged_trajectory.xtc")
-unified_xtc_path = os.path.join(out_dir, "unified_trajectory.xtc")
+    if len(valid_frames) < 2:
+        raise ValueError(
+            f"Too few valid frames remaining ({len(valid_frames)}) to perform clustering (minimum 2 required)."
+        )
 
-print(f"\n--- Exporting Physical Unified Trajectory ---")
-print(f"Writing {len(valid_frames)} aligned frames ({len(u_consensus.atoms)} atoms per frame) to {merged_xtc_path}...")
+    ctx.unique_tags = list(dict.fromkeys(ctx.dataset_tags))
+    sampled_frames, filtered_tags, sampling_msg = downsample_per_dataset(
+        valid_frames, ctx.dataset_tags, ctx.config.max_frames
+    )
+    ctx.valid_frames = sampled_frames
+    ctx.dataset_tags = filtered_tags
+    ctx.methodology.append(sampling_msg)
 
-coords_array = np.empty((len(valid_frames), len(pca_atom_indices), 3), dtype=np.float32)
-STREAM_CHUNK = 1024
+    return StageResult(
+        stage_name="stage2_skimming",
+        success=True,
+        exit_code=0,
+        artifacts=artifacts,
+        metrics={"n_valid_frames": int(len(sampled_frames)), "n_datasets": len(ctx.unique_tags)},
+    )
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage3_reduction/__init__.py"
+"""Stage 3: Kabsch alignment, merged trajectory export, PCA, and allostery."""
 
-with mda.Writer(merged_xtc_path, n_atoms=u_consensus.atoms.n_atoms) as w:
-    for ds_idx, (pdb_p, xtc_p, label, u_ds, _, _) in enumerate(temp_universes):
-        ds_start = dataset_offsets[ds_idx]
-        ds_end = dataset_offsets[ds_idx + 1]
-        ds_valid_mask = (valid_frames >= ds_start) & (valid_frames < ds_end)
-        if not np.any(ds_valid_mask):
-            continue
-        
-        ds_valid_out_indices = np.where(ds_valid_mask)[0]
-        ds_valid_local_frames = valid_frames[ds_valid_mask] - ds_start
-        
-        indexer = ds_consensus_indexers[ds_idx]
-        scale = dataset_scales[ds_idx]
-        
-        chunk_coords = []
-        chunk_dest_idx = []
-        ptr = 0
-        n_needed = len(ds_valid_local_frames)
-        
-        for f_i, ts in enumerate(u_ds.trajectory):
-            if ptr >= n_needed:
-                break
-            if f_i == ds_valid_local_frames[ptr]:
-                chunk_coords.append(ts.positions[indexer])
-                chunk_dest_idx.append(ds_valid_out_indices[ptr])
-                ptr += 1
-                
-                if len(chunk_coords) == STREAM_CHUNK:
-                    c_batch = np.array(chunk_coords, dtype=np.float32)
-                    if scale != 1.0:
-                        c_batch *= scale
-                    batched_kabsch(c_batch, ref_consensus_mean, out=c_batch)
-                    for pos in c_batch:
-                        u_consensus.atoms.positions = pos
-                        w.write(u_consensus.atoms)
-                    coords_array[chunk_dest_idx] = c_batch[:, pca_atom_indices, :]
-                    chunk_coords.clear()
-                    chunk_dest_idx.clear()
-                    
-        if len(chunk_coords) > 0:
-            c_batch = np.array(chunk_coords, dtype=np.float32)
-            if scale != 1.0:
-                c_batch *= scale
-            batched_kabsch(c_batch, ref_consensus_mean, out=c_batch)
-            for pos in c_batch:
-                u_consensus.atoms.positions = pos
-                w.write(u_consensus.atoms)
-            coords_array[chunk_dest_idx] = c_batch[:, pca_atom_indices, :]
-            chunk_coords.clear()
-            chunk_dest_idx.clear()
+from metflow.stage3_reduction.allostery import run_stage3
 
-print(f"  -> Exported merged trajectory to {merged_xtc_path}")
-make_alias(merged_xtc_path, unified_xtc_path)
-print(f"  -> Created unified trajectory alias at {unified_xtc_path}")
+__all__ = ["run_stage3"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage3_reduction/allostery.py"
+"""Advanced allostery (DCCM, Cavity Sub-PCA, Loop RMSD) and Stage 3 orchestration."""
 
-# Calculate RMSD to Reference
-diff_ref = coords_array - ref_bb
-rmsd_to_ref = np.sqrt(np.einsum('nai,nai->n', diff_ref, diff_ref) / coords_array.shape[1])
+import os
+from typing import List, Tuple
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from sklearn.decomposition import PCA
 
-# Calculate PCA
-X = coords_array.reshape(len(valid_frames), -1)
-pca_model = PCA(n_components=3)
+from metflow.cli import parse_res_string
+from metflow.models import StageResult, TrajectoryContext
+from metflow.stage1_ingestion.indexing import precompute_atom_indexer
+from metflow.stage3_reduction.kabsch import export_merged_trajectory
+from metflow.stage3_reduction.pca import compute_pca
 
-if args.pca_ref.lower() in ["first", "1", "ref", "reference"] or (args.pca_ref and args.pca_ref.lower() != "combined"):
-    target_tag = unique_tags[0]
-    if args.pca_ref.lower() not in ["first", "1", "ref", "reference"]:
-        for t in unique_tags:
-            if args.pca_ref.lower() in t.lower():
-                target_tag = t
-                break
-    fit_mask = np.array([t == target_tag for t in dataset_tags])
-    if np.sum(fit_mask) >= 2:
-        pca_model.fit(X[fit_mask])
-        X_pca = pca_model.transform(X)
-        print(f"\n[Reference PCA Projection] Fitted PCA model strictly on reference dataset '{target_tag}' ({np.sum(fit_mask)} frames) and projected all datasets into '{target_tag}'s PCA coordinate space.")
-        methodology.append(f"Fitted PCA on reference dataset '{target_tag}' ({np.sum(fit_mask)} frames) and projected all datasets into reference PCA space.")
-    else:
-        X_pca = pca_model.fit_transform(X)
-else:
-    X_pca = pca_model.fit_transform(X)
 
-var_explained = pca_model.explained_variance_ratio_ * 100
-methodology.append(f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%")
-
-df_data = {
-    "Frame_Index": np.arange(len(valid_frames)),
-    "Dataset": dataset_tags,
-    "RMSD_to_Reference": rmsd_to_ref,
-    "PCA_1": X_pca[:, 0],
-    "PCA_2": X_pca[:, 1],
-    "PCA_3": X_pca[:, 2]
-}
-
-# --- ADVANCED ALLOSTERY (DCCM & SUB-PCA) ---
-if args.allostery.lower() == "true":
-    print("\n--- Running Advanced Allostery Metrics ---")
-    methodology.append("\n--- Advanced Allostery Metrics ---")
-    
-    print("Calculating Dynamic Cross-Correlation Matrix (DCCM)...")
-    ca_coords = coords_array
-    
-    n_ca = ca_coords.shape[1]
+def compute_dccm(ca_coords: np.ndarray) -> np.ndarray:
+    """Compute Dynamic Cross-Correlation Matrix (N_ca x N_ca) from aligned C-alpha coords."""
+    n_frames, n_ca, _ = ca_coords.shape
     mean_coords = np.mean(ca_coords, axis=0)
     fluct = ca_coords - mean_coords
-    
     fluct_flat = fluct.transpose(1, 0, 2).reshape(n_ca, -1)
-    cov = (fluct_flat @ fluct_flat.T) / len(valid_frames)
-            
+    cov = (fluct_flat @ fluct_flat.T) / max(1, n_frames)
     var = np.diag(cov)
     std = np.sqrt(np.maximum(var, 1e-12))
-    dccm = cov / np.outer(std, std)
-    
+    return cov / np.outer(std, std)
+
+
+def compute_cavity_subpca(
+    cav_coords: np.ndarray,
+    loop_coords: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute 2-comp Sub-PCA on cavity coordinates and Loop RMSD to mean."""
+    n_frames = cav_coords.shape[0]
+    X_cav = cav_coords.reshape(n_frames, -1)
+    n_comp = max(1, min(2, X_cav.shape[0], X_cav.shape[1]))
+    sub_pca_model = PCA(n_components=n_comp)
+    cav_pca_raw = sub_pca_model.fit_transform(X_cav)
+    sub_var_raw = sub_pca_model.explained_variance_ratio_ * 100.0
+
+    if n_comp < 2:
+        cav_pca = np.zeros((n_frames, 2), dtype=cav_pca_raw.dtype)
+        cav_pca[:, :n_comp] = cav_pca_raw
+        sub_var_explained = np.zeros(2, dtype=np.float64)
+        sub_var_explained[:n_comp] = sub_var_raw
+    else:
+        cav_pca = cav_pca_raw
+        sub_var_explained = sub_var_raw
+
+    mean_loop = np.mean(loop_coords, axis=0)
+    loop_rmsd = np.sqrt(np.mean(np.sum((loop_coords - mean_loop) ** 2, axis=2), axis=1))
+    return cav_pca, sub_var_explained, loop_rmsd, sub_pca_model.components_
+
+
+def run_allostery(ctx: TrajectoryContext) -> List[str]:
+    """Run DCCM and optional Cavity Sub-PCA + Loop RMSD analysis."""
+    import MDAnalysis as mda
+
+    config = ctx.config
+    if not config.is_allostery:
+        return []
+
+    out_dir = ctx.out_dir
+    valid_frames = ctx.valid_frames
+    artifacts: List[str] = []
+
+    print("\n--- Running Advanced Allostery Metrics ---")
+    ctx.methodology.append("\n--- Advanced Allostery Metrics ---")
+
+    print("Calculating Dynamic Cross-Correlation Matrix (DCCM)...")
+    dccm = compute_dccm(ctx.coords_array)
+
+    dccm_path = os.path.join(out_dir, "dccm_heatmap.png")
     plt.figure(figsize=(8, 7))
     sns.heatmap(dccm, cmap="coolwarm", center=0, xticklabels=20, yticklabels=20)
     plt.title("Dynamic Cross-Correlation Matrix (DCCM)")
     plt.xlabel("Residue Index")
     plt.ylabel("Residue Index")
-    plt.savefig(f"{out_dir}/dccm_heatmap.png", dpi=300, bbox_inches="tight")
+    plt.savefig(dccm_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved DCCM Heatmap to {out_dir}/dccm_heatmap.png")
-    methodology.append("Generated Dynamic Cross-Correlation Matrix (DCCM).")
+    print(f"Saved DCCM Heatmap to {dccm_path}")
+    ctx.methodology.append("Generated Dynamic Cross-Correlation Matrix (DCCM).")
+    artifacts.append(dccm_path)
 
-    if args.cavity_res and args.loop_res:
-        cav_res = parse_res_string(args.cavity_res)
-        loop_res = parse_res_string(args.loop_res)
-        
-        cav_str = " ".join([str(x) for x in cav_res])
-        loop_str = " ".join([str(x) for x in loop_res])
-        
+    if config.cavity_res and config.loop_res:
+        cav_res = parse_res_string(config.cavity_res)
+        loop_res = parse_res_string(config.loop_res)
+        cav_str = " ".join(str(x) for x in cav_res)
+
         cav_indexers = []
         loop_indexers = []
-        for idx, u_ds in enumerate(universes):
+        for idx, u_ds in enumerate(ctx.universes):
             c_atoms = []
             for r_num in cav_res:
                 r_idx = r_num - 1
-                if 0 <= r_idx < len(ds_residues_homologous[idx]):
-                    t_res = ds_residues_homologous[idx][r_idx]
+                if 0 <= r_idx < len(ctx.ds_residues_homologous[idx]):
+                    t_res = ctx.ds_residues_homologous[idx][r_idx]
                     ca_m = t_res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
                     c_atoms.append(ca_m[0] if len(ca_m) > 0 else t_res.atoms[0])
                 else:
@@ -1134,8 +1662,8 @@ if args.allostery.lower() == "true":
             l_atoms = []
             for r_num in loop_res:
                 r_idx = r_num - 1
-                if 0 <= r_idx < len(ds_residues_homologous[idx]):
-                    t_res = ds_residues_homologous[idx][r_idx]
+                if 0 <= r_idx < len(ctx.ds_residues_homologous[idx]):
+                    t_res = ctx.ds_residues_homologous[idx][r_idx]
                     ca_m = t_res.atoms.select_atoms("name CA Ca ca CA* C-alpha Calpha")
                     l_atoms.append(ca_m[0] if len(ca_m) > 0 else t_res.atoms[0])
                 else:
@@ -1145,507 +1673,1029 @@ if args.allostery.lower() == "true":
             cav_indexers.append(precompute_atom_indexer(mda.AtomGroup(c_atoms) if c_atoms else u_ds.atoms[:0]))
             loop_indexers.append(precompute_atom_indexer(mda.AtomGroup(l_atoms) if l_atoms else u_ds.atoms[:0]))
 
-        cav_coords_list = []
-        loop_coords_list = []
-        for idx, u_ds in enumerate(universes):
-            c_c = extract_group_coords(u_ds, cav_indexers[idx])
-            l_c = extract_group_coords(u_ds, loop_indexers[idx])
-            if dataset_scales[idx] != 1.0:
-                c_c *= dataset_scales[idx]
-                l_c *= dataset_scales[idx]
-            cav_coords_list.append(c_c)
-            loop_coords_list.append(l_c)
-            
-        cav_coords = np.concatenate(cav_coords_list, axis=0)[valid_frames]
-        loop_coords = np.concatenate(loop_coords_list, axis=0)[valid_frames]
-        
+        def _indexer_len(idxer) -> int:
+            return max(0, idxer.stop - idxer.start) if isinstance(idxer, slice) else len(idxer)
+
+        n_cav_atoms = _indexer_len(cav_indexers[0]) if cav_indexers else 0
+        n_loop_atoms = _indexer_len(loop_indexers[0]) if loop_indexers else 0
+        cav_coords = np.empty((len(valid_frames), n_cav_atoms, 3), dtype=np.float32)
+        loop_coords = np.empty((len(valid_frames), n_loop_atoms, 3), dtype=np.float32)
+
+        for idx, u_ds in enumerate(ctx.universes):
+            ds_start = ctx.dataset_offsets[idx]
+            ds_end = ctx.dataset_offsets[idx + 1]
+            ds_valid_mask = (valid_frames >= ds_start) & (valid_frames < ds_end)
+            if not np.any(ds_valid_mask):
+                continue
+
+            ds_valid_out_indices = np.where(ds_valid_mask)[0]
+            ds_valid_local_frames = valid_frames[ds_valid_mask] - ds_start
+            c_idxer = cav_indexers[idx]
+            l_idxer = loop_indexers[idx]
+            scale = ctx.dataset_scales[idx]
+            ptr = 0
+            n_needed = len(ds_valid_local_frames)
+
+            for f_i, ts in enumerate(u_ds.trajectory):
+                if ptr >= n_needed:
+                    break
+                if f_i == ds_valid_local_frames[ptr]:
+                    out_i = ds_valid_out_indices[ptr]
+                    if n_cav_atoms > 0:
+                        cav_coords[out_i] = ts.positions[c_idxer]
+                    if n_loop_atoms > 0:
+                        loop_coords[out_i] = ts.positions[l_idxer]
+                    ptr += 1
+
+            if scale != 1.0:
+                if n_cav_atoms > 0:
+                    cav_coords[ds_valid_out_indices] *= scale
+                if n_loop_atoms > 0:
+                    loop_coords[ds_valid_out_indices] *= scale
+
         if cav_coords.shape[1] > 0 and loop_coords.shape[1] > 0:
             print("Calculating Targeted Sub-PCA for Allosteric Linkage...")
-            X_cav = cav_coords.reshape(len(valid_frames), -1)
-            sub_pca_model = PCA(n_components=2)
-            cav_pca = sub_pca_model.fit_transform(X_cav)
-            sub_var_explained = sub_pca_model.explained_variance_ratio_ * 100
-            
-            mean_loop = np.mean(loop_coords, axis=0)
-            loop_rmsd = np.sqrt(np.mean(np.sum((loop_coords - mean_loop)**2, axis=2), axis=1))
-            
+            cav_pca, sub_var_explained, loop_rmsd, sub_components = compute_cavity_subpca(cav_coords, loop_coords)
+
+            subpca_plot_path = os.path.join(out_dir, "allostery_subpca_plot.png")
             plt.figure(figsize=(9, 7))
             scatter = plt.scatter(cav_pca[:, 0], cav_pca[:, 1], c=loop_rmsd, cmap="viridis", alpha=0.7, s=15)
             plt.colorbar(scatter, label="Loop RMSD to Mean (Å)")
             plt.title("Cavity PCA colored by Loop Fluctuation (Allostery Plot)")
             plt.xlabel(f"Cavity PC1 ({sub_var_explained[0]:.1f}%)")
             plt.ylabel(f"Cavity PC2 ({sub_var_explained[1]:.1f}%)")
-            plt.savefig(f"{out_dir}/allostery_subpca_plot.png", dpi=300, bbox_inches="tight")
+            plt.savefig(subpca_plot_path, dpi=300, bbox_inches="tight")
             plt.close()
-            print(f"Saved Allostery Plot to {out_dir}/allostery_subpca_plot.png")
-            methodology.append(f"Targeted Sub-PCA applied to Cavity (res {cav_res}), colored by Loop RMSD (res {loop_res}). Variance: PC1={sub_var_explained[0]:.1f}%, PC2={sub_var_explained[1]:.1f}%")
+            print(f"Saved Allostery Plot to {subpca_plot_path}")
+            artifacts.append(subpca_plot_path)
+            ctx.methodology.append(
+                f"Targeted Sub-PCA applied to Cavity (res {cav_res}), colored by Loop RMSD (res {loop_res}). "
+                f"Variance: PC1={sub_var_explained[0]:.1f}%, PC2={sub_var_explained[1]:.1f}%"
+            )
 
             sub_n_atoms = cav_coords.shape[1]
-            u_first, l_first = frame_universe_map[valid_frames[0]]
+            u_first, l_first = ctx.frame_universe_map[valid_frames[0]]
             u_first.trajectory[l_first]
             sub_resids = u_first.select_atoms(f"resid {cav_str} and name CA").resids
-            sub_components = sub_pca_model.components_
-            
-            sub_atom_contrib_pc1 = np.sqrt(np.sum(sub_components[0].reshape(sub_n_atoms, 3)**2, axis=1))
-            sub_atom_contrib_pc2 = np.sqrt(np.sum(sub_components[1].reshape(sub_n_atoms, 3)**2, axis=1))
-            
-            sub_unique_resids, sub_res_inv = np.unique(sub_resids, return_inverse=True)
-            sub_res_contrib_pc1 = np.bincount(sub_res_inv, weights=sub_atom_contrib_pc1)
-            sub_res_contrib_pc2 = np.bincount(sub_res_inv, weights=sub_atom_contrib_pc2)
-            
-            plt.figure(figsize=(8, 4))
-            width = 0.35
-            x = np.arange(len(sub_unique_resids))
-            plt.bar(x - width/2, sub_res_contrib_pc1, width, label='PC1 Contribution', alpha=0.8, color='blue')
-            plt.bar(x + width/2, sub_res_contrib_pc2, width, label='PC2 Contribution', alpha=0.8, color='orange')
-            plt.xticks(x, sub_unique_resids)
-            plt.xlabel('Cavity Residue Number')
-            plt.ylabel('Loading Magnitude (RMS)')
-            plt.title('Per-Residue Contribution to Cavity Sub-PCA')
-            plt.legend()
-            plt.grid(True, alpha=0.3, axis='y')
-            plt.savefig(f'{out_dir}/allostery_subpca_loadings.png', dpi=300, bbox_inches='tight')
-            plt.close()
-            print(f"Saved Sub-PCA Loadings Plot to {out_dir}/allostery_subpca_loadings.png")
+            if len(sub_resids) == sub_n_atoms:
+                sub_atom_contrib_pc1 = np.sqrt(np.sum(sub_components[0].reshape(sub_n_atoms, 3) ** 2, axis=1))
+                sub_atom_contrib_pc2 = (
+                    np.sqrt(np.sum(sub_components[1].reshape(sub_n_atoms, 3) ** 2, axis=1))
+                    if sub_components.shape[0] > 1
+                    else np.zeros(sub_n_atoms)
+                )
 
-# --- CLUSTERING MODULE ---
-if args.cluster != "none":
-    print(f"\n--- Starting Clustering Modules ---")
-    methodology.append("\n--- Clustering Analysis ---")
+                sub_unique_resids, sub_res_inv = np.unique(sub_resids, return_inverse=True)
+                sub_res_contrib_pc1 = np.bincount(sub_res_inv, weights=sub_atom_contrib_pc1)
+                sub_res_contrib_pc2 = np.bincount(sub_res_inv, weights=sub_atom_contrib_pc2)
 
-    methods_to_run = ["pca_kmeans", "daura", "cnn"] if args.cluster == "all" else [args.cluster]
+                loadings_path = os.path.join(out_dir, "allostery_subpca_loadings.png")
+                plt.figure(figsize=(8, 4))
+                width = 0.35
+                x = np.arange(len(sub_unique_resids))
+                plt.bar(x - width / 2, sub_res_contrib_pc1, width, label="PC1 Contribution", alpha=0.8, color="blue")
+                plt.bar(x + width / 2, sub_res_contrib_pc2, width, label="PC2 Contribution", alpha=0.8, color="orange")
+                plt.xticks(x, sub_unique_resids)
+                plt.xlabel("Cavity Residue Number")
+                plt.ylabel("Loading Magnitude (RMS)")
+                plt.title("Per-Residue Contribution to Cavity Sub-PCA")
+                plt.legend()
+                plt.grid(True, alpha=0.3, axis="y")
+                plt.savefig(loadings_path, dpi=300, bbox_inches="tight")
+                plt.close()
+                print(f"Saved Sub-PCA Loadings Plot to {loadings_path}")
+                artifacts.append(loadings_path)
 
-    if args.cluster in ["daura", "cnn", "all"]:
-        print("Calculating pairwise distance matrix...")
-        N = len(valid_frames)
-        rmsd_matrix = pairwise_distances(X, metric='euclidean', n_jobs=-1) / np.sqrt(coords_array.shape[1])
+    return artifacts
+
+
+def run_stage3(ctx: TrajectoryContext) -> StageResult:
+    """Execute Stage 3: streaming Kabsch export, global/ref PCA, and allostery."""
+    coords_array, rmsd_to_ref = export_merged_trajectory(ctx)
+    ctx.coords_array = coords_array
+    ctx.rmsd_to_ref = rmsd_to_ref
+
+    X = coords_array.reshape(len(ctx.valid_frames), -1)
+    ctx.X = X
+
+    X_pca, pca_model, var_explained, method_note = compute_pca(
+        X, ctx.dataset_tags, ctx.unique_tags, pca_ref=ctx.config.pca_ref, n_components=3
+    )
+    ctx.X_pca = X_pca
+    ctx.pca_model = pca_model
+    ctx.var_explained = var_explained
+    if method_note:
+        ctx.methodology.append(method_note)
+    ctx.methodology.append(
+        f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%"
+    )
+
+    ctx.df_data = {
+        "Frame_Index": np.arange(len(ctx.valid_frames)),
+        "Dataset": ctx.dataset_tags,
+        "RMSD_to_Reference": rmsd_to_ref,
+        "PCA_1": X_pca[:, 0],
+        "PCA_2": X_pca[:, 1],
+        "PCA_3": X_pca[:, 2],
+    }
+
+    artifacts = [ctx.merged_xtc_path, ctx.unified_xtc_path]
+    artifacts.extend(run_allostery(ctx))
+
+    return StageResult(
+        stage_name="stage3_reduction",
+        success=True,
+        exit_code=0,
+        artifacts=artifacts,
+        metrics={
+            "n_frames": int(len(ctx.valid_frames)),
+            "pca_var_explained": [float(v) for v in var_explained],
+        },
+    )
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage3_reduction/kabsch.py"
+"""Batched Kabsch superposition and streaming unified trajectory export."""
+
+import os
+from typing import Tuple
+import numpy as np
+
+from metflow.models import TrajectoryContext
+from metflow.stage1_ingestion.loader import make_alias
+
+
+def batched_kabsch(
+    P_raw: np.ndarray,
+    Q_ref: np.ndarray,
+    out: np.ndarray = None,
+    chunk_size: int = 1024,
+) -> np.ndarray:
+    """Superpose (N, A, 3) frames in P_raw onto centered (A, 3) reference Q_ref."""
+    n_samples = len(P_raw)
+    if n_samples == 0:
+        return P_raw
+    if out is None:
+        out = np.empty_like(P_raw)
+
+    for start in range(0, n_samples, chunk_size):
+        end = min(start + chunk_size, n_samples)
+        chunk = P_raw[start:end]
+        c_mean = chunk.mean(axis=1, keepdims=True)
+        c_centered = chunk - c_mean
+        H = np.matmul(c_centered.swapaxes(1, 2), Q_ref)
+        U, _, Vt = np.linalg.svd(H)
+        R = np.matmul(U, Vt)
+        dets = (
+            R[:, 0, 0] * (R[:, 1, 1] * R[:, 2, 2] - R[:, 1, 2] * R[:, 2, 1])
+            - R[:, 0, 1] * (R[:, 1, 0] * R[:, 2, 2] - R[:, 1, 2] * R[:, 2, 0])
+            + R[:, 0, 2] * (R[:, 1, 0] * R[:, 2, 1] - R[:, 1, 1] * R[:, 2, 0])
+        )
+        neg_mask = dets < 0
+        if np.any(neg_mask):
+            U[neg_mask, :, 2] *= -1
+            R[neg_mask] = np.matmul(U[neg_mask], Vt[neg_mask])
+        np.matmul(c_centered, R, out=out[start:end])
+    return out
+
+
+def export_merged_trajectory(
+    ctx: TrajectoryContext,
+    stream_chunk: int = 1024,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Stream-align consensus heavy atoms, write merged_trajectory.xtc, and compute RMSD."""
+    import MDAnalysis as mda
+
+    out_dir = ctx.out_dir
+    valid_frames = ctx.valid_frames
+    u_consensus = ctx.u_consensus
+    ref_consensus_mean = ctx.ref_consensus_mean
+    pca_atom_indices = ctx.pca_atom_indices
+
+    merged_xtc_path = os.path.join(out_dir, "merged_trajectory.xtc")
+    unified_xtc_path = os.path.join(out_dir, "unified_trajectory.xtc")
+    ctx.merged_xtc_path = merged_xtc_path
+    ctx.unified_xtc_path = unified_xtc_path
+
+    print("\n--- Exporting Physical Unified Trajectory ---")
+    print(
+        f"Writing {len(valid_frames)} aligned frames ({len(u_consensus.atoms)} atoms per frame) "
+        f"to {merged_xtc_path}..."
+    )
+
+    coords_array = np.empty((len(valid_frames), len(pca_atom_indices), 3), dtype=np.float32)
+    n_consensus_atoms = u_consensus.atoms.n_atoms
+    c_batch_buf = np.empty((stream_chunk, n_consensus_atoms, 3), dtype=np.float32)
+    dest_idx_buf = np.empty(stream_chunk, dtype=np.intp)
+
+    with mda.Writer(merged_xtc_path, n_atoms=n_consensus_atoms) as w:
+        def _flush_batch(count: int, scale: float) -> None:
+            c_batch = c_batch_buf[:count]
+            if scale != 1.0:
+                c_batch *= scale
+            batched_kabsch(c_batch, ref_consensus_mean, out=c_batch)
+            for pos in c_batch:
+                u_consensus.atoms.positions = pos
+                w.write(u_consensus.atoms)
+            coords_array[dest_idx_buf[:count]] = c_batch[:, pca_atom_indices, :]
+
+        for ds_idx, (_, _, _, u_ds, _, _) in enumerate(ctx.temp_universes):
+            ds_start = ctx.dataset_offsets[ds_idx]
+            ds_end = ctx.dataset_offsets[ds_idx + 1]
+            ds_valid_mask = (valid_frames >= ds_start) & (valid_frames < ds_end)
+            if not np.any(ds_valid_mask):
+                continue
+
+            ds_valid_out_indices = np.where(ds_valid_mask)[0]
+            ds_valid_local_frames = valid_frames[ds_valid_mask] - ds_start
+            indexer = ctx.ds_consensus_indexers[ds_idx]
+            scale = ctx.dataset_scales[ds_idx]
+
+            buf_ptr = 0
+            ptr = 0
+            n_needed = len(ds_valid_local_frames)
+
+            for f_i, ts in enumerate(u_ds.trajectory):
+                if ptr >= n_needed:
+                    break
+                if f_i == ds_valid_local_frames[ptr]:
+                    c_batch_buf[buf_ptr] = ts.positions[indexer]
+                    dest_idx_buf[buf_ptr] = ds_valid_out_indices[ptr]
+                    buf_ptr += 1
+                    ptr += 1
+
+                    if buf_ptr == stream_chunk:
+                        _flush_batch(buf_ptr, scale)
+                        buf_ptr = 0
+
+            if buf_ptr > 0:
+                _flush_batch(buf_ptr, scale)
+
+    print(f"  -> Exported merged trajectory to {merged_xtc_path}")
+    make_alias(merged_xtc_path, unified_xtc_path, out_dir)
+    print(f"  -> Created unified trajectory alias at {unified_xtc_path}")
+
+    diff_ref = coords_array - ctx.ref_bb
+    rmsd_to_ref = np.sqrt(np.einsum("nai,nai->n", diff_ref, diff_ref) / coords_array.shape[1])
+    return coords_array, rmsd_to_ref
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage3_reduction/pca.py"
+"""Global and reference-projected PCA computation."""
+
+from typing import List, Optional, Tuple
+import numpy as np
+from sklearn.decomposition import PCA
+
+
+def compute_pca(
+    X: np.ndarray,
+    dataset_tags: List[str],
+    unique_tags: List[str],
+    pca_ref: str = "combined",
+    n_components: int = 3,
+) -> Tuple[np.ndarray, PCA, np.ndarray, Optional[str]]:
+    """Compute 3-component PCA (with safe padding when n_samples < 3 or n_features < 3)."""
+    n_samples, n_features = X.shape
+    actual_comp = max(1, min(n_components, n_samples, n_features))
+    pca_model = PCA(n_components=actual_comp)
+    method_note: Optional[str] = None
+
+    use_ref = bool(
+        pca_ref
+        and (
+            pca_ref.lower() in ["first", "1", "ref", "reference"]
+            or pca_ref.lower() != "combined"
+        )
+    )
+    if use_ref and unique_tags:
+        target_tag = unique_tags[0]
+        if pca_ref.lower() not in ["first", "1", "ref", "reference"]:
+            for t in unique_tags:
+                if pca_ref.lower() in t.lower():
+                    target_tag = t
+                    break
+        fit_mask = np.array([t == target_tag for t in dataset_tags])
+        if np.sum(fit_mask) >= max(2, actual_comp):
+            pca_model.fit(X[fit_mask])
+            X_pca_raw = pca_model.transform(X)
+            print(
+                f"\n[Reference PCA Projection] Fitted PCA model strictly on reference dataset "
+                f"'{target_tag}' ({np.sum(fit_mask)} frames) and projected all datasets into "
+                f"'{target_tag}'s PCA coordinate space."
+            )
+            method_note = (
+                f"Fitted PCA on reference dataset '{target_tag}' ({np.sum(fit_mask)} frames) "
+                f"and projected all datasets into reference PCA space."
+            )
+        else:
+            X_pca_raw = pca_model.fit_transform(X)
     else:
-        N = len(valid_frames)
+        X_pca_raw = pca_model.fit_transform(X)
+
+    var_raw = pca_model.explained_variance_ratio_ * 100.0
+
+    # Pad to n_components columns so downstream PCA_1..PCA_3 always exist even for n_frames == 2
+    if actual_comp < n_components:
+        X_pca = np.zeros((n_samples, n_components), dtype=X_pca_raw.dtype)
+        X_pca[:, :actual_comp] = X_pca_raw
+        var_explained = np.zeros(n_components, dtype=np.float64)
+        var_explained[:actual_comp] = var_raw
+    else:
+        X_pca = X_pca_raw
+        var_explained = var_raw
+
+    return X_pca, pca_model, var_explained, method_note
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage4_clustering/__init__.py"
+"""Stage 4: Pairwise RMSD matrix and clustering algorithms (KMeans, Daura, CNN)."""
+
+from metflow.stage4_clustering.cnn import run_stage4
+
+__all__ = ["run_stage4"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage4_clustering/cnn.py"
+"""CNN (DBSCAN) density clustering and Stage 4 orchestration."""
+
+import os
+from typing import List
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+
+from metflow.models import StageResult, TrajectoryContext
+from metflow.stage4_clustering.daura import run_daura
+from metflow.stage4_clustering.kmeans import run_kmeans
+from metflow.stage4_clustering.pairwise import compute_pairwise_rmsd, make_centroid_extractor
+
+
+def run_cnn(rmsd_matrix: np.ndarray, eps: float, min_samples: int = 3) -> np.ndarray:
+    """Run DBSCAN density clustering on precomputed pairwise RMSD matrix."""
+    print(f"\n[ CNN ] Running Optimized DBSCAN with eps={eps}...")
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed", n_jobs=-1)
+    return dbscan.fit_predict(rmsd_matrix)
+
+
+def run_stage4(ctx: TrajectoryContext) -> StageResult:
+    """Execute Stage 4: pairwise RMSD, requested clustering methods, and centroid export."""
+    config = ctx.config
+    if config.cluster == "none":
+        return StageResult(
+            stage_name="stage4_clustering",
+            success=True,
+            exit_code=0,
+            metrics={"skipped": True},
+        )
+
+    out_dir = ctx.out_dir
+    valid_frames = ctx.valid_frames
+    X = ctx.X
+    X_pca = ctx.X_pca
+    dataset_tags = ctx.dataset_tags
+    rmsd_to_ref = ctx.rmsd_to_ref
+    artifacts: List[str] = []
+
+    print("\n--- Starting Clustering Modules ---")
+    ctx.methodology.append("\n--- Clustering Analysis ---")
+
+    methods_to_run = ["pca_kmeans", "daura", "cnn"] if config.cluster == "all" else [config.cluster]
+    allowed_methods = {"pca_kmeans", "daura", "cnn"}
+    for m in methods_to_run:
+        if m not in allowed_methods:
+            raise ValueError(f"Unknown clustering method: {m}")
+
+    if config.cluster in ["daura", "cnn", "all"]:
+        print("Calculating pairwise distance matrix...")
+        ctx.rmsd_matrix = compute_pairwise_rmsd(X, ctx.coords_array.shape[1])
+
+    extract_c = make_centroid_extractor(
+        ctx.merged_ref_path, ctx.merged_xtc_path, valid_frames, ctx.frame_universe_map
+    )
+
+    try:
+        for m in methods_to_run:
+            method_dir = os.path.join(out_dir, m)
+            os.makedirs(method_dir, exist_ok=True)
+
+            if m == "pca_kmeans":
+                labels, centers, best_k, auto_det = run_kmeans(X_pca, config.k)
+                ctx.df_data["PCA_KMeans_Cluster"] = labels
+                for cid in range(best_k):
+                    pts = X_pca[labels == cid]
+                    if len(pts) > 0:
+                        c_idx = int(np.where(labels == cid)[0][np.argmin(np.linalg.norm(pts - centers[cid], axis=1))])
+                        artifacts.append(extract_c("pca_kmeans", c_idx, cid, method_dir))
+                ctx.methodology.append(
+                    f"PCA+KMeans (k={best_k}) used."
+                    + (" Optimal 'k' detected via Silhouette Score." if auto_det else "")
+                )
+            elif m == "daura":
+                labels, centroids = run_daura(ctx.rmsd_matrix, config.rmsd, config.k)
+                ctx.df_data["Daura_Cluster"] = labels
+                for cid, c_idx in enumerate(centroids):
+                    artifacts.append(extract_c("daura", c_idx, cid, method_dir))
+                ctx.methodology.append(
+                    f"Daura greedy clustering (cutoff {config.rmsd} Å) extracted {len(centroids)} centroids."
+                )
+            elif m == "cnn":
+                labels = run_cnn(ctx.rmsd_matrix, config.cnn_eps, min_samples=3)
+                ctx.df_data["CNN_Cluster"] = labels
+                for cid in set(labels):
+                    if cid == -1:
+                        continue
+                    idxs = np.where(labels == cid)[0]
+                    sums = ctx.rmsd_matrix[np.ix_(idxs, idxs)].sum(axis=1)
+                    center = int(idxs[np.argmin(sums)])
+                    artifacts.append(extract_c("cnn", center, int(cid), method_dir))
+                ctx.methodology.append(
+                    f"CNN/DBSCAN: Density-based clustering (eps={config.cnn_eps}) extracted "
+                    f"{len(set(labels) - {-1})} clusters."
+                )
+            else:
+                raise ValueError(f"Unknown clustering method: {m}")
+
+            df_method = pd.DataFrame({
+                "Frame_Index": np.arange(len(valid_frames)),
+                "Dataset": dataset_tags,
+                "RMSD_to_Ref": rmsd_to_ref,
+                "PCA_1": X_pca[:, 0],
+                "PCA_2": X_pca[:, 1],
+                "PCA_3": X_pca[:, 2],
+                "Cluster_ID": labels,
+            })
+            csv_path = os.path.join(method_dir, f"{m}_metrics.csv")
+            df_method.to_csv(csv_path, index=False)
+            artifacts.append(csv_path)
+    finally:
+        if hasattr(extract_c, "close"):
+            try:
+                extract_c.close()
+            except Exception:
+                pass
+
+    return StageResult(
+        stage_name="stage4_clustering",
+        success=True,
+        exit_code=0,
+        artifacts=artifacts,
+        metrics={"methods": methods_to_run},
+    )
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage4_clustering/daura.py"
+"""Vectorized Daura / GROMOS greedy RMSD clustering."""
+
+from typing import List, Tuple
+import numpy as np
+
+
+def run_daura(
+    rmsd_matrix: np.ndarray,
+    rmsd_cutoff: float,
+    k: int,
+) -> Tuple[np.ndarray, List[int]]:
+    """Run vectorized Daura greedy clustering; k <= 0 allows unlimited clusters."""
+    n_samples = rmsd_matrix.shape[0]
+    if n_samples == 0:
+        raise ValueError("Cannot run Daura clustering on 0 frames.")
+
+    print(f"\n[ Daura ] Running Vectorized Daura Clustering with RMSD Cutoff {rmsd_cutoff} Å...")
+    unclustered = np.ones(n_samples, dtype=bool)
+    centroids: List[int] = []
+    max_clusters = k if k > 0 else n_samples
+
+    neighborhoods = rmsd_matrix < rmsd_cutoff
+    while unclustered.any():
+        counts = neighborhoods.dot(unclustered).astype(int)
+        counts[~unclustered] = -1
+        best_c = int(np.argmax(counts))
+        best_h = neighborhoods[best_c] & unclustered
+        centroids.append(best_c)
+        unclustered[best_h] = False
+        if len(centroids) >= max_clusters:
+            break
+
+    labels = np.argmin(rmsd_matrix[:, centroids], axis=1)
+    return labels, centroids
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage4_clustering/kmeans.py"
+"""PCA + KMeans clustering with Silhouette auto-k and small-sample safety."""
+
+from typing import Tuple
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+
+def run_kmeans(X_pca: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray, int, bool]:
+    """Run KMeans on PCA coordinates; auto-detect k if k <= 0 and clamp to n_samples."""
+    n_samples = len(X_pca)
+    if n_samples == 0:
+        raise ValueError("Cannot run KMeans on 0 samples.")
+
+    auto_det = False
+    if k <= 0:
+        print("\n[ PCA + KMeans ] Auto-detecting optimal 'k' using Silhouette Analysis...")
+        auto_det = True
+        if n_samples < 3:
+            best_k = min(2, n_samples)
+            print(f"  -> Too few samples ({n_samples}) for Silhouette; using k = {best_k}")
+        else:
+            best_score = -1.0
+            best_k = 2
+            max_test_k = min(15, n_samples - 1)
+            for k_test in range(2, max_test_k + 1):
+                labels_test = KMeans(n_clusters=k_test, random_state=42, n_init="auto").fit_predict(X_pca)
+                if len(set(labels_test)) < 2:
+                    continue
+                score = silhouette_score(X_pca, labels_test)
+                if score > best_score:
+                    best_score = score
+                    best_k = k_test
+            print(f"  -> Optimal clusters detected: k = {best_k} (Silhouette Score: {best_score:.3f})")
+    else:
+        best_k = min(k, n_samples)
+        if best_k != k:
+            print(f"\n[ PCA + KMeans ] Clamped k={k} to n_samples={n_samples}.")
+        else:
+            print(f"\n[ PCA + KMeans ] Running with explicit k={best_k}...")
+
+    kmeans = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
+    labels = kmeans.fit_predict(X_pca)
+    return labels, kmeans.cluster_centers_, best_k, auto_det
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage4_clustering/pairwise.py"
+"""Pairwise RMSD calculation and centroid PDB extraction."""
+
+from typing import Any, Callable, List, Tuple
+import numpy as np
+from sklearn.metrics import pairwise_distances
+
+
+def compute_pairwise_rmsd(X: np.ndarray, n_atoms: int) -> np.ndarray:
+    """Compute pairwise RMSD matrix (N x N) from flattened aligned coordinates."""
+    if n_atoms <= 0:
+        raise ValueError("n_atoms must be > 0 to compute pairwise RMSD.")
+    dists = pairwise_distances(X, metric="euclidean", n_jobs=-1)
+    dists /= dists.dtype.type(np.sqrt(n_atoms))
+    return dists
+
+
+def make_centroid_extractor(
+    merged_ref_path: str,
+    merged_xtc_path: str,
+    valid_frames: np.ndarray,
+    frame_universe_map: List[Tuple[Any, int]],
+) -> Callable[[str, int, int, str], str]:
+    """Create a centroid PDB writer backed by the merged trajectory or source universes."""
+    import MDAnalysis as mda
 
     try:
         u_centroid_src = mda.Universe(merged_ref_path, merged_xtc_path)
-        def extract_c(pfx, c_idx, cid, out_dir):
+
+        def extract_c(pfx: str, c_idx: int, cid: int, out_dir: str) -> str:
             u_centroid_src.trajectory[c_idx]
-            u_centroid_src.atoms.write(f"{out_dir}/{pfx}_centroid_{cid}.pdb")
+            out_path = f"{out_dir}/{pfx}_centroid_{cid}.pdb"
+            u_centroid_src.atoms.write(out_path)
+            return out_path
+
+        extract_c.close = u_centroid_src.trajectory.close  # type: ignore[attr-defined]
+        return extract_c
     except Exception:
-        def extract_c(pfx, c_idx, cid, out_dir):
+
+        def extract_c(pfx: str, c_idx: int, cid: int, out_dir: str) -> str:
             frame_idx = valid_frames[c_idx]
             u_curr, local_idx = frame_universe_map[frame_idx]
             u_curr.trajectory[local_idx]
-            u_curr.atoms.write(f"{out_dir}/{pfx}_centroid_{cid}.pdb")
+            out_path = f"{out_dir}/{pfx}_centroid_{cid}.pdb"
+            u_curr.atoms.write(out_path)
+            return out_path
 
-    for m in methods_to_run:
-        
-        if m == "pca_kmeans":
-            best_k = args.k
-            auto_det = False
-            
-            if args.k <= 0:
-                print("\n[ PCA + KMeans ] Auto-detecting optimal 'k' using Silhouette Analysis...")
-                auto_det = True
-                best_score = -1.0
-                best_k = 2
-                max_test_k = min(15, len(X_pca) - 1)
-                for k_test in range(2, max_test_k + 1):
-                    labels_test = KMeans(n_clusters=k_test, random_state=42, n_init="auto").fit_predict(X_pca)
-                    score = silhouette_score(X_pca, labels_test)
-                    if score > best_score:
-                        best_score = score
-                        best_k = k_test
-                print(f"  -> Optimal clusters detected: k = {best_k} (Silhouette Score: {best_score:.3f})")
-            else:
-                print(f"\n[ PCA + KMeans ] Running with explicit k={args.k}...")
-                
-            kmeans = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
-            labels = kmeans.fit_predict(X_pca)
-            df_data["PCA_KMeans_Cluster"] = labels
-            
-            method_dir = f"{out_dir}/pca_kmeans"
-            os.makedirs(method_dir, exist_ok=True)
-            for k in range(best_k):
-                pts = X_pca[labels == k]
-                if len(pts) > 0:
-                    c_idx = np.where(labels == k)[0][np.argmin(np.linalg.norm(pts - kmeans.cluster_centers_[k], axis=1))]
-                    extract_c("pca_kmeans", c_idx, k, method_dir)
-                    
-            df_method = pd.DataFrame({"Frame_Index": np.arange(len(valid_frames)), "Dataset": dataset_tags, "RMSD_to_Ref": rmsd_to_ref, "PCA_1": X_pca[:,0], "PCA_2": X_pca[:,1], "PCA_3": X_pca[:,2], "Cluster_ID": labels})
-            df_method.to_csv(f"{method_dir}/{m}_metrics.csv", index=False)
-            methodology.append(f"PCA+KMeans (k={best_k}) used." + (" Optimal 'k' detected via Silhouette Score." if auto_det else ""))
-            
-        elif m == "daura":
-            print(f"\n[ Daura ] Running Vectorized Daura Clustering with RMSD Cutoff {args.rmsd} Å...")
-            unclustered = np.ones(N, dtype=bool)
-            centroids = []
-            
-            neighborhoods = (rmsd_matrix < args.rmsd)
-            while unclustered.any():
-                counts = neighborhoods.dot(unclustered)
-                counts[~unclustered] = -1
-                best_c = np.argmax(counts)
-                best_h = neighborhoods[best_c] & unclustered
-                centroids.append(best_c)
-                unclustered[best_h] = False
-                if len(centroids) >= args.k:
-                    break
-                    
-            labels = np.argmin(rmsd_matrix[:, centroids], axis=1)
-            df_data["Daura_Cluster"] = labels
-            
-            method_dir = f"{out_dir}/daura"
-            os.makedirs(method_dir, exist_ok=True)
-            for i, c in enumerate(centroids):
-                extract_c("daura", c, i, method_dir)
-            
-            df_method = pd.DataFrame({"Frame_Index": np.arange(len(valid_frames)), "Dataset": dataset_tags, "RMSD_to_Ref": rmsd_to_ref, "PCA_1": X_pca[:,0], "PCA_2": X_pca[:,1], "PCA_3": X_pca[:,2], "Cluster_ID": labels})
-            df_method.to_csv(f"{method_dir}/{m}_metrics.csv", index=False)
-            methodology.append(f"Daura greedy clustering (cutoff {args.rmsd} Å) extracted {len(centroids)} centroids.")
-        
-        elif m == "cnn":
-            print(f"\n[ CNN ] Running Optimized DBSCAN with eps={args.cnn_eps}...")
-            dbscan = DBSCAN(eps=args.cnn_eps, min_samples=3, metric="precomputed", n_jobs=-1)
-            labels = dbscan.fit_predict(rmsd_matrix)
-            
-            df_data["CNN_Cluster"] = labels
-            
-            method_dir = f"{out_dir}/cnn"
-            os.makedirs(method_dir, exist_ok=True)
-            for k in set(labels):
-                if k == -1:
-                    continue
-                idxs = np.where(labels == k)[0]
-                sums = rmsd_matrix[np.ix_(idxs, idxs)].sum(axis=1)
-                center = idxs[np.argmin(sums)]
-                extract_c("cnn", center, k, method_dir)
-                
-            df_method = pd.DataFrame({"Frame_Index": np.arange(len(valid_frames)), "Dataset": dataset_tags, "RMSD_to_Ref": rmsd_to_ref, "PCA_1": X_pca[:,0], "PCA_2": X_pca[:,1], "PCA_3": X_pca[:,2], "Cluster_ID": labels})
-            df_method.to_csv(f"{method_dir}/{m}_metrics.csv", index=False)
-            methodology.append(f"CNN/DBSCAN: Density-based clustering (eps={args.cnn_eps}) extracted {len(set(labels)-{-1})} clusters.")
+        extract_c.close = lambda: None  # type: ignore[attr-defined]
+        return extract_c
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage5_energy/__init__.py"
+"""Stage 5: OpenMM thermodynamic energy evaluation and CSV fusion."""
 
-# --- ENERGY CALCULATION MODULE (OpenMM) ---
-if args.calc_energy.lower() == "true":
-    print("\n--- Calculating Thermodynamic Energy (OpenMM Physical Minimization) ---")
-    methodology.append("\n--- OpenMM Energy Calculation ---")
+from metflow.stage5_energy.openmm_engine import run_stage5
+
+__all__ = ["run_stage5"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage5_energy/csv_fusion.py"
+"""Smart CSV fusion for preserving and merging OpenMM energy checkpoints."""
+
+import os
+from typing import Any, Dict
+import numpy as np
+import pandas as pd
+
+
+def is_valid_energy(val: Any) -> bool:
+    """Return True if val is a finite, non-NaN numeric energy value."""
+    if pd.isna(val):
+        return False
     try:
-        try:
-            import pkg_resources
-        except ImportError:
-            try:
-                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "setuptools==69.0.0"], check=True)
-                import pkg_resources
-            except Exception:
-                pass
-        from openmm.app import PDBFile, ForceField, Modeller, HBonds, NoCutoff
-        import openmm as mm
-        import openmm.unit as unit
-        from tqdm import tqdm
-        from pdbfixer import PDBFixer
+        f = float(val)
+        return not (np.isnan(f) or np.isinf(f))
+    except Exception:
+        return False
 
-        print("  -> Initializing OpenMM system from clean consensus reference...")
-        merged_ref_path = os.path.join(out_dir, "merged_reference.pdb")
-        if not os.path.exists(merged_ref_path):
-            merged_ref_path = master_ref_pdb
 
-        prot_res_str = " ".join(PROTEIN_RESNAMES)
-        u_ref_clean = mda.Universe(merged_ref_path)
-        u_heavy = u_ref_clean.select_atoms(f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)")
-        if len(u_heavy) == 0:
-            u_heavy = u_ref_clean.select_atoms("not (name H* or name [0-9]H* or type H or element H or resname WAT or resname HOH or resname SOL or resname NA or resname CL)")
-        
-        resnames = list(u_heavy.residues.resnames)
-        for i in range(len(resnames)):
-            if resnames[i] in ['HIE', 'HID', 'HIP', 'HSD', 'HSE', 'HSP']:
-                resnames[i] = 'HIS'
-            elif resnames[i] in ['CYX', 'CYM']:
-                resnames[i] = 'CYS'
-            elif resnames[i] in ['MSE']:
-                resnames[i] = 'MET'
-        u_heavy.residues.resnames = resnames
-        
-        tmp_pdb = f"{out_dir}/tmp_clean_heavy.pdb"
-        u_heavy.write(tmp_pdb)
-        
-        print("  -> Initializing OpenMM with amber14/obc2 implicit solvent...")
-
-        print("  -> Fixing missing heavy atoms (e.g. OXT) with PDBFixer...")
-        fixer = PDBFixer(filename=tmp_pdb)
-        
-        fixer.findMissingResidues()
-        fixer.missingResidues = {}
-        
-        fixer.findNonstandardResidues()
-        fixer.replaceNonstandardResidues()
-        fixer.findMissingAtoms()
-        fixer.addMissingAtoms()
-        
-        u_heavy_res_to_idx = {res: idx for idx, res in enumerate(u_heavy.residues)}
-        u_atom_map = {
-            (u_heavy_res_to_idx[a.residue], a.name.strip().upper()): i
-            for i, a in enumerate(u_heavy.atoms)
-        }
-        
-        fixed_to_orig = []
-        parent_atom = []
-        for a in fixer.topology.atoms():
-            key = (a.residue.index, a.name.strip().upper())
-            if key in u_atom_map:
-                fixed_to_orig.append(u_atom_map[key])
-                parent_atom.append(-1)
-            else:
-                fixed_to_orig.append(-1)
-                anchor = -1
-                for other in a.residue.atoms():
-                    k2 = (other.residue.index, other.name.strip().upper())
-                    if k2 in u_atom_map:
-                        anchor = u_atom_map[k2]
-                        if other.name.strip().upper() in ['CA', 'C', 'N']:
-                            break
-                parent_atom.append(anchor)
-
-        fixed_to_orig_arr = np.array(fixed_to_orig, dtype=int)
-        parent_atom_arr = np.array(parent_atom, dtype=int)
-        
-        fixed_mask = (fixed_to_orig_arr != -1)
-        anchor_mask = (~fixed_mask) & (parent_atom_arr != -1)
-        fallback_mask = (~fixed_mask) & (~anchor_mask)
-
-        fixed_orig_idx = fixed_to_orig_arr[fixed_mask]
-        anchor_parent_idx = parent_atom_arr[anchor_mask]
-
-        num_fixer_atoms = fixer.topology.getNumAtoms()
-        n_anchor = int(np.sum(anchor_mask))
-        n_fallback = int(np.sum(fallback_mask))
-
-        forcefield = ForceField('amber14-all.xml', 'implicit/obc2.xml')
-        
-        print("  -> Building reference system and compiling context...")
-        ref_modeller = Modeller(fixer.topology, fixer.positions)
-        ref_modeller.addHydrogens(forcefield)
-        system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
-        
-        # Freeze heavy atoms so energy minimization exclusively relaxes hydrogens,
-        # preserving authentic sampled conformational backbone and sidechains.
-        for a in ref_modeller.topology.atoms():
-            if a.element.symbol != 'H':
-                system.setParticleMass(a.index, 0.0 * unit.dalton)
-        
-        integrator = mm.LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)
-        
-        try:
-            platform = mm.Platform.getPlatformByName('CUDA')
-            print("  -> 🚀 Using CUDA (GPU) for blazing fast OpenMM calculations!")
-            simulation = mm.app.Simulation(ref_modeller.topology, system, integrator, platform)
-        except Exception:
-            platform = mm.Platform.getPlatformByName('CPU')
-            print("  -> 🐢 Using CPU. (No CUDA detected). Calculations may be slow.")
-            simulation = mm.app.Simulation(ref_modeller.topology, system, integrator, platform)
-        
-        ref_full_pos = np.array(ref_modeller.positions.value_in_unit(unit.nanometers), dtype=np.float32)
-        ref_pos = np.array(fixer.positions.value_in_unit(unit.nanometers), dtype=np.float32)
-        ref_pos_anchor = ref_pos[anchor_parent_idx] if n_anchor > 0 else None
-        ref_pos_anchor_offset = (ref_pos[anchor_mask] - ref_pos_anchor) if n_anchor > 0 else None
-        
-        heavy_to_full = []
-        full_atoms = list(ref_modeller.topology.atoms())
-        full_atom_dict = {(a.residue.chain.index, a.residue.index, a.name.strip().upper()): i for i, a in enumerate(full_atoms)}
-        for a in fixer.topology.atoms():
-            key = (a.residue.chain.index, a.residue.index, a.name.strip().upper())
-            heavy_to_full.append(full_atom_dict.get(key, -1))
-            
-        heavy_to_full_arr = np.array(heavy_to_full, dtype=int)
-        valid_h2f_mask = (heavy_to_full_arr != -1)
-        valid_h2f_src = np.where(valid_h2f_mask)[0]
-        valid_h2f_dst = heavy_to_full_arr[valid_h2f_mask]
-            
-        # Map parent heavy atom for every hydrogen to prevent ghost clashes
-        h_parent_map = {}
-        for bond in ref_modeller.topology.bonds():
-            a1, a2 = bond[0], bond[1]
-            is_h1 = (a1.element.symbol == 'H')
-            is_h2 = (a2.element.symbol == 'H')
-            if is_h1 and not is_h2:
-                h_parent_map[a1.index] = a2.index
-            elif is_h2 and not is_h1:
-                h_parent_map[a2.index] = a1.index
-
-        h_indices = np.array(sorted(h_parent_map.keys()), dtype=int)
-        if len(h_indices) > 0:
-            h_parents = np.array([h_parent_map[i] for i in h_indices], dtype=int)
-            h_offsets = ref_full_pos[h_indices] - ref_full_pos[h_parents]
-        else:
-            h_parents = np.array([], dtype=int)
-            h_offsets = np.zeros((0, 3), dtype=np.float32)
-
-        # Inspect if merged trajectory is available for direct coordinate streaming
-        merged_xtc_path = os.path.join(out_dir, "merged_trajectory.xtc")
-        if os.path.exists(merged_ref_path) and os.path.exists(merged_xtc_path):
-            try:
-                u_openmm = mda.Universe(merged_ref_path, merged_xtc_path)
-                use_merged_traj = (len(u_openmm.trajectory) == len(valid_frames))
-            except Exception:
-                use_merged_traj = False
-        else:
-            use_merged_traj = False
-
-        if not use_merged_traj:
-            universe_heavy_info = {}
-            for u_obj in set(u for u, _ in frame_universe_map):
-                u_h = u_obj.select_atoms(f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)")
-                if len(u_h) == 0:
-                    u_h = u_obj.select_atoms("not (name H* or name [0-9]H* or type H or element H or resname WAT or resname HOH or resname SOL or resname NA or resname CL)")
-                h_indexer = precompute_atom_indexer(u_h)
-                if len(u_h) == len(u_heavy):
-                    map_idx = None
-                else:
-                    curr_map = {(a.resid, a.name): i for i, a in enumerate(u_h)}
-                    map_idx = np.zeros(len(u_heavy), dtype=int)
-                    for m_idx, m_atom in enumerate(u_heavy.atoms):
-                        key = (m_atom.resid, m_atom.name)
-                        if key in curr_map:
-                            map_idx[m_idx] = curr_map[key]
-                        else:
-                            map_idx[m_idx] = min(m_idx, len(u_h) - 1)
-                universe_heavy_info[id(u_obj)] = (h_indexer, map_idx)
-
-        energy_csv = f"{out_dir}/energy_checkpoint.csv"
-        energy_dict = {}
-
-        def is_valid_energy(val):
-            if pd.isna(val):
-                return False
-            try:
-                f = float(val)
-                return not (np.isnan(f) or np.isinf(f))
-            except Exception:
-                return False
-        
-        if os.path.exists(energy_csv):
-            try:
-                df_resume = pd.read_csv(energy_csv)
-                ene_col = "Energy_kcal_mol" if "Energy_kcal_mol" in df_resume.columns else "Energy"
-                raw_dict = dict(zip(df_resume["Frame"], df_resume[ene_col]))
-                energy_dict = {f: v for f, v in raw_dict.items() if is_valid_energy(v)}
-                print(f"  -> Found checkpoint! Resuming {len(energy_dict)} valid previously minimized frames...")
-            except Exception:
-                energy_dict = {}
-                
-        relax_steps = args.min_steps if args.min_steps > 0 else 25
-        if args.min_steps > 0:
-            print(f"  -> Relaxing hydrogens and evaluating energy ({args.min_steps} steps per frame, heavy atoms frozen)...")
-        else:
-            print("  -> Evaluating potential energy with hydrogen clash-relief (25 steps per frame, heavy atoms frozen)...")
-
-        try:
-            for local_idx, frame_idx in enumerate(tqdm(valid_frames)):
-                if frame_idx in energy_dict and is_valid_energy(energy_dict[frame_idx]):
-                    continue
-                    
-                if use_merged_traj:
-                    ts = u_openmm.trajectory[local_idx]
-                    frame_orig_pos = ts.positions * 0.1  # Angstroms to nm
-                    heavy_pos_src = frame_orig_pos
-                else:
-                    u_curr, raw_local_idx = frame_universe_map[frame_idx]
-                    ts = u_curr.trajectory[raw_local_idx]
-                    h_indexer, map_idx = universe_heavy_info[id(u_curr)]
-                    pos_angstroms = ts.positions[h_indexer]
-                    pos_centered = pos_angstroms - pos_angstroms.mean(axis=0)
-                    rms_dist = np.sqrt(np.mean(np.sum(pos_centered**2, axis=1)))
-                    scale = 0.1 if rms_dist >= 5.0 else 1.0
-                    frame_orig_pos = pos_angstroms * scale
-                    if map_idx is None:
-                        heavy_pos_src = frame_orig_pos
-                    else:
-                        heavy_pos_src = frame_orig_pos[map_idx]
-
-                full_heavy_pos = np.zeros((num_fixer_atoms, 3), dtype=np.float32)
-                full_heavy_pos[fixed_mask] = heavy_pos_src[fixed_orig_idx]
-                if n_anchor > 0:
-                    full_heavy_pos[anchor_mask] = heavy_pos_src[anchor_parent_idx] + ref_pos_anchor_offset + np.random.normal(0, 0.001, (n_anchor, 3))
-                if n_fallback > 0:
-                    full_heavy_pos[fallback_mask] = ref_pos[fallback_mask]
-
-                current_full_pos = ref_full_pos.copy()
-                current_full_pos[valid_h2f_dst] = full_heavy_pos[valid_h2f_src]
-                if len(h_indices) > 0:
-                    current_full_pos[h_indices] = current_full_pos[h_parents] + h_offsets
-                
-                try:
-                    simulation.context.setPositions(current_full_pos * unit.nanometers)
-                    simulation.minimizeEnergy(maxIterations=relax_steps)
-                    state = simulation.context.getState(getEnergy=True)
-                    energy_val = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
-
-                    if np.isnan(energy_val) or np.isinf(energy_val):
-                        energy_val = np.nan
-                except Exception:
-                    energy_val = np.nan
-
-                energy_dict[frame_idx] = energy_val
-                
-                if len(energy_dict) % 50 == 0:
-                    pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"]).to_csv(energy_csv, index=False)
-                    
-        except KeyboardInterrupt:
-            df_partial = pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"])
-            df_partial.to_csv(energy_csv, index=False)
-            print(f"\n⚠️  Energy calculation PAUSED by user! Saved checkpoint ({len(energy_dict)} frames) to {energy_csv}")
-            
-            if len(df_partial) > 1:
-                plt.figure(figsize=(10, 5))
-                plt.subplot(1, 2, 1)
-                plt.scatter(df_partial["Frame"], df_partial["Energy_kcal_mol"], alpha=0.5, s=10, color='red')
-                plt.xlabel("Frame Index")
-                plt.ylabel("Potential Energy (kcal/mol)")
-                plt.title("Partial Energy Timeline")
-                
-                plt.subplot(1, 2, 2)
-                valid_partial = df_partial["Energy_kcal_mol"].dropna()
-                if len(valid_partial) > 0:
-                    plt.hist(valid_partial, bins=30, color='blue', alpha=0.7)
-                plt.xlabel("Potential Energy (kcal/mol)")
-                plt.ylabel("Frequency (Count)")
-                plt.title("Partial Energy Distribution")
-                
-                plt.tight_layout()
-                partial_plot = f"{out_dir}/partial_energy_progress.png"
-                plt.savefig(partial_plot, dpi=300)
-                plt.close()
-                print(f"📊 Generated a progress visualization of your partial results: {partial_plot}")
-                
-            print("Run the script again to resume exactly where you left off.")
-            sys.exit(0)
-            
-        pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"]).to_csv(energy_csv, index=False)
-        
-        energies_kcal = [energy_dict.get(f, np.nan) for f in valid_frames]
-        df_data["OpenMM_Energy_kcal_mol"] = energies_kcal
-        valid_cnt = sum(1 for e in energies_kcal if pd.notna(e))
-        methodology.append(f"Evaluated Thermodynamic Potential Energy (OpenMM, Amber14/OBC2, {args.min_steps}-step Minimization, {valid_cnt}/{len(valid_frames)} valid).")
-        print(f"✅ OpenMM Energy Evaluation complete ({valid_cnt}/{len(valid_frames)} valid frames).")
-        
-    except Exception as e:
-        print(f"❌ Error during OpenMM Energy calculation: {e}")
-        methodology.append(f"OpenMM Energy Calculation failed: {e}")
-
-# --- Smart CSV Fusion (Preserve Energy Data) ---
-energy_csv = f"{out_dir}/energy_checkpoint.csv"
-if "OpenMM_Energy_kcal_mol" not in df_data and os.path.exists(energy_csv):
+def fuse_energy_csv(
+    df_data: Dict[str, Any],
+    valid_frames: np.ndarray,
+    energy_csv: str,
+) -> int:
+    """Fuse existing energy_checkpoint.csv into df_data if not already populated."""
+    if "OpenMM_Energy_kcal_mol" in df_data or not os.path.exists(energy_csv):
+        return 0
     try:
         df_resume = pd.read_csv(energy_csv)
         ene_col = "Energy_kcal_mol" if "Energy_kcal_mol" in df_resume.columns else "Energy"
         energy_dict = dict(zip(df_resume["Frame"], df_resume[ene_col]))
         df_data["OpenMM_Energy_kcal_mol"] = [energy_dict.get(f, np.nan) for f in valid_frames]
         print(f"✅ Auto-fused {len(energy_dict)} existing energy evaluations into clustering results!")
-    except Exception as e:
-        print(f"⚠️ Could not fuse energy checkpoint: {e}")
+        return len(energy_dict)
+    except Exception as exc:
+        print(f"⚠️ Could not fuse energy checkpoint: {exc}")
+        return 0
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage5_energy/openmm_engine.py"
+"""OpenMM Amber14/OBC2 frozen-heavy-atom energy evaluation with checkpointing."""
 
-print("\n--- Generating Final Outputs ---")
-df = pd.DataFrame(df_data)
+import os
+import subprocess
+import sys
+from typing import Dict, List, Tuple
 
-# ==========================================
-# Generate Static HTML Art Nouveau Dashboard
-# ==========================================
-html_content = """<!DOCTYPE html>
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from metflow.models import StageResult, TrajectoryContext
+from metflow.stage1_ingestion.indexing import PROTEIN_RESNAMES, precompute_atom_indexer
+from metflow.stage5_energy.csv_fusion import fuse_energy_csv, is_valid_energy
+
+
+def _save_partial_plot(df_partial: pd.DataFrame, out_dir: str) -> str:
+    """Generate partial_energy_progress.png on KeyboardInterrupt."""
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.scatter(df_partial["Frame"], df_partial["Energy_kcal_mol"], alpha=0.5, s=10, color="red")
+    plt.xlabel("Frame Index")
+    plt.ylabel("Potential Energy (kcal/mol)")
+    plt.title("Partial Energy Timeline")
+
+    plt.subplot(1, 2, 2)
+    valid_partial = df_partial["Energy_kcal_mol"].dropna()
+    if len(valid_partial) > 0:
+        plt.hist(valid_partial, bins=30, color="blue", alpha=0.7)
+    plt.xlabel("Potential Energy (kcal/mol)")
+    plt.ylabel("Frequency (Count)")
+    plt.title("Partial Energy Distribution")
+
+    plt.tight_layout()
+    partial_plot = os.path.join(out_dir, "partial_energy_progress.png")
+    plt.savefig(partial_plot, dpi=300)
+    plt.close()
+    print(f"📊 Generated a progress visualization of your partial results: {partial_plot}")
+    return partial_plot
+
+
+def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, List[str]]:
+    """Evaluate OpenMM potential energies with 50-frame checkpointing and clean interrupt handling."""
+    import MDAnalysis as mda
+
+    config = ctx.config
+    out_dir = ctx.out_dir
+    valid_frames = ctx.valid_frames
+    artifacts: List[str] = []
+
+    try:
+        import pkg_resources  # noqa: F401
+    except ImportError:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "setuptools==69.0.0"], check=True)
+        except Exception:
+            pass
+
+    from openmm.app import ForceField, HBonds, Modeller, NoCutoff
+    import openmm as mm
+    import openmm.unit as unit
+    from pdbfixer import PDBFixer
+    from tqdm import tqdm
+
+    print("  -> Initializing OpenMM system from clean consensus reference...")
+    merged_ref_path = ctx.merged_ref_path or os.path.join(out_dir, "merged_reference.pdb")
+    if not os.path.exists(merged_ref_path):
+        merged_ref_path = ctx.master_ref_pdb
+
+    prot_res_str = " ".join(PROTEIN_RESNAMES)
+    u_ref_clean = mda.Universe(merged_ref_path)
+    u_heavy = u_ref_clean.select_atoms(
+        f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
+    )
+    if len(u_heavy) == 0:
+        u_heavy = u_ref_clean.select_atoms(
+            "not (name H* or name [0-9]H* or type H or element H or "
+            "resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
+        )
+
+    resnames = list(u_heavy.residues.resnames)
+    for i in range(len(resnames)):
+        if resnames[i] in ["HIE", "HID", "HIP", "HSD", "HSE", "HSP"]:
+            resnames[i] = "HIS"
+        elif resnames[i] in ["CYX", "CYM"]:
+            resnames[i] = "CYS"
+        elif resnames[i] in ["MSE"]:
+            resnames[i] = "MET"
+    u_heavy.residues.resnames = resnames
+
+    tmp_pdb = os.path.join(out_dir, "tmp_clean_heavy.pdb")
+    u_heavy.write(tmp_pdb)
+
+    print("  -> Initializing OpenMM with amber14/obc2 implicit solvent...")
+    print("  -> Fixing missing heavy atoms (e.g. OXT) with PDBFixer...")
+    fixer = PDBFixer(filename=tmp_pdb)
+    fixer.findMissingResidues()
+    fixer.missingResidues = {}
+    fixer.findNonstandardResidues()
+    fixer.replaceNonstandardResidues()
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+
+    u_heavy_res_to_idx = {res: idx for idx, res in enumerate(u_heavy.residues)}
+    u_atom_map = {
+        (u_heavy_res_to_idx[a.residue], a.name.strip().upper()): i
+        for i, a in enumerate(u_heavy.atoms)
+    }
+
+    fixed_to_orig = []
+    parent_atom = []
+    for a in fixer.topology.atoms():
+        key = (a.residue.index, a.name.strip().upper())
+        if key in u_atom_map:
+            fixed_to_orig.append(u_atom_map[key])
+            parent_atom.append(-1)
+        else:
+            fixed_to_orig.append(-1)
+            anchor = -1
+            for other in a.residue.atoms():
+                k2 = (other.residue.index, other.name.strip().upper())
+                if k2 in u_atom_map:
+                    anchor = u_atom_map[k2]
+                    if other.name.strip().upper() in ["CA", "C", "N"]:
+                        break
+            parent_atom.append(anchor)
+
+    fixed_to_orig_arr = np.array(fixed_to_orig, dtype=int)
+    parent_atom_arr = np.array(parent_atom, dtype=int)
+
+    fixed_mask = fixed_to_orig_arr != -1
+    anchor_mask = (~fixed_mask) & (parent_atom_arr != -1)
+    fallback_mask = (~fixed_mask) & (~anchor_mask)
+
+    fixed_orig_idx = fixed_to_orig_arr[fixed_mask]
+    anchor_parent_idx = parent_atom_arr[anchor_mask]
+
+    num_fixer_atoms = fixer.topology.getNumAtoms()
+    n_anchor = int(np.sum(anchor_mask))
+    n_fallback = int(np.sum(fallback_mask))
+
+    forcefield = ForceField("amber14-all.xml", "implicit/obc2.xml")
+    print("  -> Building reference system and compiling context...")
+    ref_modeller = Modeller(fixer.topology, fixer.positions)
+    ref_modeller.addHydrogens(forcefield)
+    system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
+
+    for a in ref_modeller.topology.atoms():
+        if a.element.symbol != "H":
+            system.setParticleMass(a.index, 0.0 * unit.dalton)
+
+    integrator = mm.LangevinMiddleIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
+    try:
+        platform = mm.Platform.getPlatformByName("CUDA")
+        print("  -> 🚀 Using CUDA (GPU) for blazing fast OpenMM calculations!")
+    except Exception:
+        platform = mm.Platform.getPlatformByName("CPU")
+        print("  -> 🐢 Using CPU. (No CUDA detected). Calculations may be slow.")
+    simulation = mm.app.Simulation(ref_modeller.topology, system, integrator, platform)
+
+    ref_full_pos = np.array(ref_modeller.positions.value_in_unit(unit.nanometers), dtype=np.float32)
+    ref_pos = np.array(fixer.positions.value_in_unit(unit.nanometers), dtype=np.float32)
+    ref_pos_anchor = ref_pos[anchor_parent_idx] if n_anchor > 0 else None
+    ref_pos_anchor_offset = (ref_pos[anchor_mask] - ref_pos_anchor) if n_anchor > 0 else None
+
+    full_atoms = list(ref_modeller.topology.atoms())
+    full_atom_dict = {(a.residue.chain.index, a.residue.index, a.name.strip().upper()): i for i, a in enumerate(full_atoms)}
+    heavy_to_full = [
+        full_atom_dict.get((a.residue.chain.index, a.residue.index, a.name.strip().upper()), -1)
+        for a in fixer.topology.atoms()
+    ]
+    heavy_to_full_arr = np.array(heavy_to_full, dtype=int)
+    valid_h2f_mask = heavy_to_full_arr != -1
+    valid_h2f_src = np.where(valid_h2f_mask)[0]
+    valid_h2f_dst = heavy_to_full_arr[valid_h2f_mask]
+
+    h_parent_map = {}
+    for bond in ref_modeller.topology.bonds():
+        a1, a2 = bond[0], bond[1]
+        is_h1 = a1.element.symbol == "H"
+        is_h2 = a2.element.symbol == "H"
+        if is_h1 and not is_h2:
+            h_parent_map[a1.index] = a2.index
+        elif is_h2 and not is_h1:
+            h_parent_map[a2.index] = a1.index
+
+    h_indices = np.array(sorted(h_parent_map.keys()), dtype=int)
+    if len(h_indices) > 0:
+        h_parents = np.array([h_parent_map[i] for i in h_indices], dtype=int)
+        h_offsets = ref_full_pos[h_indices] - ref_full_pos[h_parents]
+    else:
+        h_parents = np.array([], dtype=int)
+        h_offsets = np.zeros((0, 3), dtype=np.float32)
+
+    merged_xtc_path = ctx.merged_xtc_path or os.path.join(out_dir, "merged_trajectory.xtc")
+    use_merged_traj = False
+    u_openmm = None
+    if os.path.exists(merged_ref_path) and os.path.exists(merged_xtc_path):
+        try:
+            u_openmm = mda.Universe(merged_ref_path, merged_xtc_path)
+            use_merged_traj = len(u_openmm.trajectory) == len(valid_frames)
+        except Exception:
+            use_merged_traj = False
+
+    universe_heavy_info = {}
+    if not use_merged_traj:
+        for u_obj in set(u for u, _ in ctx.frame_universe_map):
+            u_h = u_obj.select_atoms(
+                f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
+            )
+            if len(u_h) == 0:
+                u_h = u_obj.select_atoms(
+                    "not (name H* or name [0-9]H* or type H or element H or "
+                    "resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
+                )
+            h_indexer = precompute_atom_indexer(u_h)
+            if len(u_h) == len(u_heavy):
+                map_idx = None
+            else:
+                curr_map = {(a.resid, a.name): i for i, a in enumerate(u_h)}
+                map_idx = np.zeros(len(u_heavy), dtype=int)
+                for m_idx, m_atom in enumerate(u_heavy.atoms):
+                    key = (m_atom.resid, m_atom.name)
+                    map_idx[m_idx] = curr_map.get(key, min(m_idx, len(u_h) - 1))
+            universe_heavy_info[id(u_obj)] = (h_indexer, map_idx)
+
+    energy_csv = os.path.join(out_dir, "energy_checkpoint.csv")
+    energy_dict: Dict[int, float] = {}
+    if os.path.exists(energy_csv):
+        try:
+            df_resume = pd.read_csv(energy_csv)
+            ene_col = "Energy_kcal_mol" if "Energy_kcal_mol" in df_resume.columns else "Energy"
+            raw_dict = dict(zip(df_resume["Frame"], df_resume[ene_col]))
+            energy_dict = {int(f): v for f, v in raw_dict.items() if is_valid_energy(v)}
+            print(f"  -> Found checkpoint! Resuming {len(energy_dict)} valid previously minimized frames...")
+        except Exception:
+            energy_dict = {}
+
+    relax_steps = config.min_steps if config.min_steps > 0 else 25
+    if config.min_steps > 0:
+        print(f"  -> Relaxing hydrogens and evaluating energy ({config.min_steps} steps per frame, heavy atoms frozen)...")
+    else:
+        print("  -> Evaluating potential energy with hydrogen clash-relief (25 steps per frame, heavy atoms frozen)...")
+
+    full_heavy_pos = np.zeros((num_fixer_atoms, 3), dtype=np.float32)
+    if n_fallback > 0:
+        full_heavy_pos[fallback_mask] = ref_pos[fallback_mask]
+    current_full_pos = ref_full_pos.copy()
+
+    try:
+        for local_idx, frame_idx in enumerate(tqdm(valid_frames)):
+            frame_key = int(frame_idx)
+            if frame_key in energy_dict and is_valid_energy(energy_dict[frame_key]):
+                continue
+
+            if use_merged_traj:
+                ts = u_openmm.trajectory[local_idx]
+                heavy_pos_src = ts.positions * 0.1
+            else:
+                u_curr, raw_local_idx = ctx.frame_universe_map[frame_key]
+                ts = u_curr.trajectory[raw_local_idx]
+                h_indexer, map_idx = universe_heavy_info[id(u_curr)]
+                pos_angstroms = ts.positions[h_indexer]
+                pos_centered = pos_angstroms - pos_angstroms.mean(axis=0)
+                rms_dist = np.sqrt(np.mean(np.sum(pos_centered ** 2, axis=1)))
+                scale = 0.1 if rms_dist >= 5.0 else 1.0
+                frame_orig_pos = pos_angstroms * scale
+                heavy_pos_src = frame_orig_pos if map_idx is None else frame_orig_pos[map_idx]
+
+            full_heavy_pos[fixed_mask] = heavy_pos_src[fixed_orig_idx]
+            if n_anchor > 0:
+                full_heavy_pos[anchor_mask] = (
+                    heavy_pos_src[anchor_parent_idx]
+                    + ref_pos_anchor_offset
+                    + np.random.normal(0, 0.001, (n_anchor, 3))
+                )
+
+            current_full_pos[valid_h2f_dst] = full_heavy_pos[valid_h2f_src]
+            if len(h_indices) > 0:
+                current_full_pos[h_indices] = current_full_pos[h_parents] + h_offsets
+
+            try:
+                simulation.context.setPositions(current_full_pos * unit.nanometers)
+                simulation.minimizeEnergy(maxIterations=relax_steps)
+                state = simulation.context.getState(getEnergy=True)
+                energy_val = state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
+                if np.isnan(energy_val) or np.isinf(energy_val):
+                    energy_val = np.nan
+            except Exception:
+                energy_val = np.nan
+
+            energy_dict[frame_key] = energy_val
+            if len(energy_dict) % 50 == 0:
+                pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"]).to_csv(
+                    energy_csv, index=False
+                )
+    except KeyboardInterrupt:
+        df_partial = pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"])
+        df_partial.to_csv(energy_csv, index=False)
+        artifacts.append(energy_csv)
+        print(f"\n⚠️  Energy calculation PAUSED by user! Saved checkpoint ({len(energy_dict)} frames) to {energy_csv}")
+        if len(df_partial) > 1:
+            artifacts.append(_save_partial_plot(df_partial, out_dir))
+        print("Run the script again to resume exactly where you left off.")
+        return energy_dict, True, artifacts
+    finally:
+        if u_openmm is not None:
+            try:
+                u_openmm.trajectory.close()
+            except Exception:
+                pass
+
+    pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"]).to_csv(energy_csv, index=False)
+    artifacts.append(energy_csv)
+    return energy_dict, False, artifacts
+
+
+def run_stage5(ctx: TrajectoryContext) -> StageResult:
+    """Execute Stage 5: optional OpenMM energy calculation and checkpoint CSV fusion."""
+    config = ctx.config
+    out_dir = ctx.out_dir
+    valid_frames = ctx.valid_frames
+    artifacts: List[str] = []
+
+    if config.is_calc_energy:
+        print("\n--- Calculating Thermodynamic Energy (OpenMM Physical Minimization) ---")
+        ctx.methodology.append("\n--- OpenMM Energy Calculation ---")
+        try:
+            energy_dict, interrupted, energy_artifacts = run_openmm_energy(ctx)
+            artifacts.extend(energy_artifacts)
+            if interrupted:
+                ctx.energy_interrupted = True
+                return StageResult(
+                    stage_name="stage5_energy",
+                    success=True,
+                    exit_code=0,
+                    artifacts=artifacts,
+                    metrics={"interrupted": True, "evaluated_frames": len(energy_dict)},
+                )
+            energies_kcal = [energy_dict.get(int(f), np.nan) for f in valid_frames]
+            ctx.df_data["OpenMM_Energy_kcal_mol"] = energies_kcal
+            valid_cnt = sum(1 for e in energies_kcal if pd.notna(e))
+            ctx.methodology.append(
+                f"Evaluated Thermodynamic Potential Energy (OpenMM, Amber14/OBC2, {config.min_steps}-step "
+                f"Minimization, {valid_cnt}/{len(valid_frames)} valid)."
+            )
+            print(f"✅ OpenMM Energy Evaluation complete ({valid_cnt}/{len(valid_frames)} valid frames).")
+        except Exception as exc:
+            print(f"❌ Error during OpenMM Energy calculation: {exc}")
+            ctx.methodology.append(f"OpenMM Energy Calculation failed: {exc}")
+
+    energy_csv = os.path.join(out_dir, "energy_checkpoint.csv")
+    fused_count = fuse_energy_csv(ctx.df_data, valid_frames, energy_csv)
+    return StageResult(
+        stage_name="stage5_energy",
+        success=True,
+        exit_code=0,
+        artifacts=artifacts,
+        metrics={"interrupted": False, "fused_count": fused_count},
+    )
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/__init__.py"
+"""Stage 6: Static plots, interactive Art Nouveau dashboard, and reports."""
+
+from metflow.stage6_visualization.reports import run_stage6
+
+__all__ = ["run_stage6"]
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/dashboard.py"
+"""Art Nouveau HTML dashboard generation and --only_dashboard fast path."""
+
+import os
+from typing import Optional
+import pandas as pd
+
+DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -2654,267 +3704,458 @@ html_content = """<!DOCTYPE html>
 </body>
 </html>"""
 
-try:
-    df.rename(columns={"PCA_1": f"PCA_1 ({var_explained[0]:.1f}%)", "PCA_2": f"PCA_2 ({var_explained[1]:.1f}%)", "PCA_3": f"PCA_3 ({var_explained[2]:.1f}%)"}, inplace=True)
-except Exception:
-    pass
 
-df_json = df.to_json(orient="records")
-html_final = html_content.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
 
-df.to_csv(f"{out_dir}/global_cluster_metrics.csv", index=False)
-print(f"Saved complete metrics to {out_dir}/global_cluster_metrics.csv")
-
-with open(f"{out_dir}/metflow_dashboard.html", "w", encoding="utf-8") as f:
-    f.write(html_final)
-print(f"🌟 Generated interactive Dashboard (with embedded data for zero-CORS offline browsing!): {out_dir}/metflow_dashboard.html")
-
-# Generate PCA Dataset Origin Comparison Plot
-plt.figure(figsize=(10, 8))
-unique_datasets = list(pd.unique(df["Dataset"]))
-n_ds = len(unique_datasets)
-if n_ds <= 10:
-    palette = sns.color_palette("tab10", n_ds)
-elif n_ds <= 20:
-    palette = sns.color_palette("tab20", n_ds)
-else:
-    palette = sns.color_palette("husl", n_ds)
-
-pc1_col_name = [c for c in df.columns if c.startswith("PCA_1")][0]
-pc2_col_name = [c for c in df.columns if c.startswith("PCA_2")][0]
-
-for i, ds in enumerate(unique_datasets):
-    sub = df[df["Dataset"] == ds]
-    plt.scatter(sub[pc1_col_name], sub[pc2_col_name], label=f"{ds} (n={len(sub)})", color=palette[i % len(palette)], alpha=0.6, s=15)
-
-plt.legend(title="Dataset", bbox_to_anchor=(1.05, 1), loc='upper left')
-plt.title("Multi-Trajectory PCA Projections by Origin Dataset")
-plt.xlabel(pc1_col_name)
-plt.ylabel(pc2_col_name)
-plt.savefig(f"{out_dir}/pca_dataset_comparison.png", dpi=300, bbox_inches="tight")
-plt.close()
-print(f"Saved PCA Dataset Comparison Plot to {out_dir}/pca_dataset_comparison.png")
-
-# Generate Energy Landscape Plot
-if "OpenMM_Energy_kcal_mol" in df.columns:
-    plt.figure(figsize=(10, 8))
-    en = df["OpenMM_Energy_kcal_mol"].dropna()
-    if len(en) > 0:
-        vmax = np.percentile(en, 95)
-        vmin = np.min(en)
-        scatter = plt.scatter(df[pc1_col_name], df[pc2_col_name], c=df["OpenMM_Energy_kcal_mol"], cmap="coolwarm", alpha=0.7, s=15, vmin=vmin, vmax=vmax)
-        plt.colorbar(scatter, label="Energy (kcal/mol)")
-        plt.title("Free Energy Landscape (PCA colored by OpenMM Energy)")
-        plt.xlabel(pc1_col_name)
-        plt.ylabel(pc2_col_name)
-        plt.savefig(f"{out_dir}/energy_landscape_plot.png", dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"Saved Energy Landscape Plot to {out_dir}/energy_landscape_plot.png")
-
-# Generate PCA 1D Distributions partitioned by origin dataset
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-if n_ds <= 10:
-    dist_palette = sns.color_palette("tab10", n_ds)
-elif n_ds <= 20:
-    dist_palette = sns.color_palette("tab20", n_ds)
-else:
-    dist_palette = sns.color_palette("husl", n_ds)
-
-for i, ds in enumerate(unique_datasets):
-    sub = df[df["Dataset"] == ds]
-    color = dist_palette[i % len(dist_palette)]
-    lbl = f"{ds} (n={len(sub)})"
-    if len(sub) > 1:
-        try:
-            sns.kdeplot(data=sub[pc1_col_name], ax=ax1, label=lbl, color=color, fill=True, alpha=0.25, warn_singular=False)
-            sns.kdeplot(data=sub[pc2_col_name], ax=ax2, label=lbl, color=color, fill=True, alpha=0.25, warn_singular=False)
-        except Exception:
-            ax1.hist(sub[pc1_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
-            ax2.hist(sub[pc2_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+def generate_dashboard(out_dir: str, df: Optional[pd.DataFrame] = None) -> str:
+    """Generate metflow_dashboard.html with embedded JSON metrics."""
+    os.makedirs(out_dir, exist_ok=True)
+    html = DASHBOARD_HTML_TEMPLATE
+    if df is not None:
+        df_json = df.to_json(orient="records")
+        html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
     else:
-        ax1.hist(sub[pc1_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
-        ax2.hist(sub[pc2_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+        csv_file = os.path.join(out_dir, "global_cluster_metrics.csv")
+        if os.path.exists(csv_file):
+            try:
+                df_dash = pd.read_csv(csv_file)
+                df_json = df_dash.to_json(orient="records")
+                html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
+            except Exception:
+                pass
 
-ax1.set_title("Conformational Density along PC1 by Dataset")
-ax1.set_xlabel(pc1_col_name)
-ax1.set_ylabel("Density")
-ax1.legend(title="Dataset")
-ax1.grid(True, alpha=0.3)
+    dash_file = os.path.join(out_dir, "metflow_dashboard.html")
+    with open(dash_file, "w", encoding="utf-8") as f:
+        f.write(html)
+    return dash_file
+EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/plots.py"
+"""Static matplotlib/seaborn plots, t-SNE, RMSD heatmaps, and PCA loadings."""
 
-ax2.set_title("Conformational Density along PC2 by Dataset")
-ax2.set_xlabel(pc2_col_name)
-ax2.set_ylabel("Density")
-ax2.legend(title="Dataset")
-ax2.grid(True, alpha=0.3)
+import os
+from typing import Any, List, Optional, Tuple
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.manifold import TSNE
 
-plt.tight_layout()
-plt.savefig(f'{out_dir}/pca_1d_distributions.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"Saved PCA 1D Distributions to {out_dir}/pca_1d_distributions.png")
 
-if is_only_energy:
-    with open(f"{out_dir}/methodology.txt", "w") as f:
-        f.write("\n".join(methodology) + "\n")
-    print("Saved methodology.txt")
-    print("==================================================")
-    print(" ✅ Option [C] Energy ONLY Evaluation Complete!")
-    print("==================================================")
-    sys.exit(0)
+def _get_dataset_palette(n_ds: int):
+    if n_ds <= 10:
+        return sns.color_palette("tab10", max(1, n_ds))
+    if n_ds <= 20:
+        return sns.color_palette("tab20", n_ds)
+    return sns.color_palette("husl", n_ds)
 
-# Generate dataset cluster summary text file
-summary_lines = ["=== Multi-Trajectory Dataset Cluster Distribution Summary ===", f"Total Datasets: {len(unique_datasets)}", f"Total Frames: {len(df)}\n"]
 
-for ds in unique_datasets:
-    ds_count = len(df[df["Dataset"] == ds])
-    summary_lines.append(f"Dataset '{ds}': {ds_count} frames ({ds_count / len(df) * 100:.1f}%)")
+def generate_comparison_plots(
+    df: pd.DataFrame,
+    out_dir: str,
+) -> Tuple[List[str], List[Any], Any]:
+    """Generate PCA dataset comparison, energy landscape, and 1D KDE/hist plots."""
+    artifacts: List[str] = []
+    unique_datasets = list(pd.unique(df["Dataset"]))
+    n_ds = len(unique_datasets)
+    palette = _get_dataset_palette(n_ds)
 
-for cluster_col in ["PCA_KMeans_Cluster", "Daura_Cluster", "CNN_Cluster"]:
-    if cluster_col in df.columns:
-        summary_lines.append(f"\n--- Cross-Tabulation: {cluster_col} ---")
-        ct = pd.crosstab(df[cluster_col], df["Dataset"], margins=True)
-        ct_pct = pd.crosstab(df[cluster_col], df["Dataset"], normalize='index') * 100
-        summary_lines.append("Counts:")
-        summary_lines.append(ct.to_string())
-        summary_lines.append("\nRow Percentages (%):")
-        summary_lines.append(ct_pct.round(1).to_string())
+    pc1_col_name = [c for c in df.columns if c.startswith("PCA_1")][0]
+    pc2_col_name = [c for c in df.columns if c.startswith("PCA_2")][0]
 
-with open(f"{out_dir}/dataset_cluster_summary.txt", "w") as f:
-    f.write("\n".join(summary_lines) + "\n")
-print(f"Saved dataset cluster summary report to {out_dir}/dataset_cluster_summary.txt")
-
-# Generate PCA Plots for each clustering method
-for cluster_col, title, out_name in [
-    ("PCA_KMeans_Cluster", "K-Means Clusters", "pca_kmeans_plot.png"),
-    ("Daura_Cluster", "Daura Clusters", "daura_plot.png"),
-    ("CNN_Cluster", "CNN/DBSCAN Clusters", "cnn_plot.png")
-]:
-    if cluster_col in df.columns:
-        plt.figure(figsize=(10, 8))
-        scatter = plt.scatter(df[f"PCA_1 ({var_explained[0]:.1f}%)"], df[f"PCA_2 ({var_explained[1]:.1f}%)"], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
-        plt.colorbar(scatter, label=title)
-        plt.title(f"PCA Projection ({title})")
-        plt.xlabel(f"Principal Component 1 ({var_explained[0]:.1f}%)")
-        plt.ylabel(f"Principal Component 2 ({var_explained[1]:.1f}%)")
-        plt.savefig(f"{out_dir}/{out_name}", dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"Saved 2D Cluster Graph to {out_dir}/{out_name}")
-
-# Generate Advanced Plots (t-SNE and RMSD Heatmaps)
-if args.advanced_plots.lower() == "true":
-    print("\n--- Generating Advanced Non-linear Projections & Heatmaps ---")
-    methodology.append("\n--- Advanced Cluster Visualizations ---")
-    
-    print("Calculating t-SNE projection (this may take a minute)...")
-    tsne_model = TSNE(n_components=2, perplexity=30, random_state=42, n_jobs=-1)
-    X_tsne = tsne_model.fit_transform(X)
-    df["tSNE_1"] = X_tsne[:, 0]
-    df["tSNE_2"] = X_tsne[:, 1]
-    
+    # 1. PCA Dataset Origin Comparison
     plt.figure(figsize=(10, 8))
     for i, ds in enumerate(unique_datasets):
         sub = df[df["Dataset"] == ds]
-        plt.scatter(sub["tSNE_1"], sub["tSNE_2"], label=f"{ds} (n={len(sub)})", color=palette[i % len(palette)], alpha=0.6, s=15)
-    plt.legend(title="Dataset", bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.title("Multi-Trajectory t-SNE Projections by Origin Dataset")
-    plt.xlabel("t-SNE Dimension 1")
-    plt.ylabel("t-SNE Dimension 2")
-    plt.savefig(f"{out_dir}/tsne_dataset_comparison.png", dpi=300, bbox_inches="tight")
+        plt.scatter(
+            sub[pc1_col_name],
+            sub[pc2_col_name],
+            label=f"{ds} (n={len(sub)})",
+            color=palette[i % len(palette)],
+            alpha=0.6,
+            s=15,
+        )
+    plt.legend(title="Dataset", bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.title("Multi-Trajectory PCA Projections by Origin Dataset")
+    plt.xlabel(pc1_col_name)
+    plt.ylabel(pc2_col_name)
+    pca_cmp_path = os.path.join(out_dir, "pca_dataset_comparison.png")
+    plt.savefig(pca_cmp_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Saved t-SNE Dataset Comparison Plot to {out_dir}/tsne_dataset_comparison.png")
-    
+    print(f"Saved PCA Dataset Comparison Plot to {pca_cmp_path}")
+    artifacts.append(pca_cmp_path)
+
+    # 2. Energy Landscape Plot
+    if "OpenMM_Energy_kcal_mol" in df.columns:
+        en = df["OpenMM_Energy_kcal_mol"].dropna()
+        if len(en) > 0:
+            plt.figure(figsize=(10, 8))
+            vmax = np.percentile(en, 95)
+            vmin = np.min(en)
+            scatter = plt.scatter(
+                df[pc1_col_name],
+                df[pc2_col_name],
+                c=df["OpenMM_Energy_kcal_mol"],
+                cmap="coolwarm",
+                alpha=0.7,
+                s=15,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            plt.colorbar(scatter, label="Energy (kcal/mol)")
+            plt.title("Free Energy Landscape (PCA colored by OpenMM Energy)")
+            plt.xlabel(pc1_col_name)
+            plt.ylabel(pc2_col_name)
+            en_plot_path = os.path.join(out_dir, "energy_landscape_plot.png")
+            plt.savefig(en_plot_path, dpi=300, bbox_inches="tight")
+            plt.close()
+            print(f"Saved Energy Landscape Plot to {en_plot_path}")
+            artifacts.append(en_plot_path)
+
+    # 3. PCA 1D Distributions partitioned by origin dataset
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    for i, ds in enumerate(unique_datasets):
+        sub = df[df["Dataset"] == ds]
+        color = palette[i % len(palette)]
+        lbl = f"{ds} (n={len(sub)})"
+        if len(sub) > 1:
+            try:
+                sns.kdeplot(data=sub[pc1_col_name], ax=ax1, label=lbl, color=color, fill=True, alpha=0.25, warn_singular=False)
+                sns.kdeplot(data=sub[pc2_col_name], ax=ax2, label=lbl, color=color, fill=True, alpha=0.25, warn_singular=False)
+            except Exception:
+                ax1.hist(sub[pc1_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+                ax2.hist(sub[pc2_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+        else:
+            ax1.hist(sub[pc1_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+            ax2.hist(sub[pc2_col_name], bins=30, density=True, alpha=0.4, color=color, label=lbl)
+
+    ax1.set_title("Conformational Density along PC1 by Dataset")
+    ax1.set_xlabel(pc1_col_name)
+    ax1.set_ylabel("Density")
+    ax1.legend(title="Dataset")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_title("Conformational Density along PC2 by Dataset")
+    ax2.set_xlabel(pc2_col_name)
+    ax2.set_ylabel("Density")
+    ax2.legend(title="Dataset")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    dist_path = os.path.join(out_dir, "pca_1d_distributions.png")
+    plt.savefig(dist_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved PCA 1D Distributions to {dist_path}")
+    artifacts.append(dist_path)
+
+    return artifacts, unique_datasets, palette
+
+
+def generate_cluster_plots(
+    df: pd.DataFrame,
+    out_dir: str,
+    var_explained: np.ndarray,
+) -> List[str]:
+    """Generate 2D PCA cluster scatter plots for each clustering method present."""
+    artifacts: List[str] = []
+    pc1_col = f"PCA_1 ({var_explained[0]:.1f}%)"
+    pc2_col = f"PCA_2 ({var_explained[1]:.1f}%)"
+    if pc1_col not in df.columns:
+        pc1_col = [c for c in df.columns if c.startswith("PCA_1")][0]
+    if pc2_col not in df.columns:
+        pc2_col = [c for c in df.columns if c.startswith("PCA_2")][0]
+
     for cluster_col, title, out_name in [
-        ("Daura_Cluster", "Daura Clusters", "tsne_daura_plot.png"),
-        ("CNN_Cluster", "CNN/DBSCAN Clusters", "tsne_cnn_plot.png")
+        ("PCA_KMeans_Cluster", "K-Means Clusters", "pca_kmeans_plot.png"),
+        ("Daura_Cluster", "Daura Clusters", "daura_plot.png"),
+        ("CNN_Cluster", "CNN/DBSCAN Clusters", "cnn_plot.png"),
     ]:
         if cluster_col in df.columns:
             plt.figure(figsize=(10, 8))
-            scatter = plt.scatter(df["tSNE_1"], df["tSNE_2"], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
+            scatter = plt.scatter(df[pc1_col], df[pc2_col], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
             plt.colorbar(scatter, label=title)
-            plt.title(f"t-SNE Projection ({title})")
-            plt.xlabel("t-SNE Dimension 1")
-            plt.ylabel("t-SNE Dimension 2")
-            plt.savefig(f"{out_dir}/{out_name}", dpi=300, bbox_inches="tight")
+            plt.title(f"PCA Projection ({title})")
+            plt.xlabel(f"Principal Component 1 ({var_explained[0]:.1f}%)")
+            plt.ylabel(f"Principal Component 2 ({var_explained[1]:.1f}%)")
+            out_path = os.path.join(out_dir, out_name)
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
             plt.close()
-            print(f"Saved t-SNE Graph to {out_dir}/{out_name}")
-            methodology.append(f"Generated t-SNE non-linear projection for {title}.")
-            
-    print("Generating Cluster RMSD Heatmaps...")
-    for cluster_col, title, out_name in [
-        ("Daura_Cluster", "Daura", "daura_rmsd_heatmap.png"),
-        ("CNN_Cluster", "CNN/DBSCAN", "cnn_rmsd_heatmap.png")
-    ]:
-        if cluster_col in df.columns:
-            sorted_idx = np.argsort(df[cluster_col].values)
-            
-            step = max(1, len(sorted_idx) // 1000)
-            downsampled_idx = sorted_idx[::step]
-            sorted_dist = rmsd_matrix[np.ix_(downsampled_idx, downsampled_idx)]
-            
-            plt.figure(figsize=(9, 8))
-            plt.imshow(sorted_dist, cmap="viridis_r", aspect="auto", interpolation="none")
-            plt.colorbar(label="RMSD (Å)")
-            plt.title(f"RMSD Pairwise Distance Matrix (Sorted by {title} Clusters)")
-            plt.xlabel("Frames (Sorted by Cluster)")
-            plt.ylabel("Frames (Sorted by Cluster)")
-            plt.savefig(f"{out_dir}/{out_name}", dpi=300, bbox_inches="tight")
-            plt.close()
-            print(f"Saved RMSD Heatmap to {out_dir}/{out_name}")
-            methodology.append(f"Generated RMSD pairwise distance block heatmap for {title} clusters.")
-
-# Generate PCA Loadings Plot
-n_atoms = len(ref_bb_atoms)
-resids = ref_bb_atoms.resids
-components = pca_model.components_
-
-atom_contrib_pc1 = np.sqrt(np.sum(components[0].reshape(n_atoms, 3)**2, axis=1))
-atom_contrib_pc2 = np.sqrt(np.sum(components[1].reshape(n_atoms, 3)**2, axis=1))
-
-unique_resids, res_inv = np.unique(resids, return_inverse=True)
-res_contrib_pc1 = np.bincount(res_inv, weights=atom_contrib_pc1)
-res_contrib_pc2 = np.bincount(res_inv, weights=atom_contrib_pc2)
-
-all_resids = np.arange(unique_resids.min(), unique_resids.max() + 1)
-pc1_full = np.full(len(all_resids), np.nan)
-pc2_full = np.full(len(all_resids), np.nan)
-
-idx_arr = unique_resids - unique_resids.min()
-pc1_full[idx_arr] = res_contrib_pc1
-pc2_full[idx_arr] = res_contrib_pc2
-
-pd.DataFrame({
-    "Residue": all_resids,
-    "PC1_Contribution": pc1_full,
-    "PC2_Contribution": pc2_full
-}).to_csv(f'{out_dir}/pca_loadings.csv', index=False)
-print(f"Saved PCA Loadings data to {out_dir}/pca_loadings.csv")
-
-plt.figure(figsize=(12, 5))
-plt.plot(all_resids, pc1_full, label='PC1 Contribution', alpha=0.8, color='blue', marker='.', markersize=4)
-plt.plot(all_resids, pc2_full, label='PC2 Contribution', alpha=0.8, color='orange', marker='.', markersize=4)
-plt.xlabel('Residue Number')
-plt.ylabel('Loading Magnitude (RMS)')
-plt.title('Per-Residue Contribution to Principal Components')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.savefig(f'{out_dir}/pca_loadings_plot.png', dpi=300, bbox_inches='tight')
-plt.close()
-print(f"Saved PCA Loadings Plot to {out_dir}/pca_loadings_plot.png")
-
-# Generate Energy Landscape Plot
+            print(f"Saved 2D Cluster Graph to {out_path}")
+            artifacts.append(out_path)
+    return artifacts
 
 
-with open(f"{out_dir}/methodology.txt", "w") as f:
-    f.write("\n".join(methodology) + "\n")
-print("Saved methodology.txt")
+def generate_advanced_plots(
+    df: pd.DataFrame,
+    X: np.ndarray,
+    rmsd_matrix: Optional[np.ndarray],
+    out_dir: str,
+    unique_datasets: List[str],
+    palette: Any,
+    methodology: List[str],
+) -> List[str]:
+    """Generate t-SNE projections (with safe perplexity) and RMSD cluster heatmaps."""
+    artifacts: List[str] = []
+    print("\n--- Generating Advanced Non-linear Projections & Heatmaps ---")
+    methodology.append("\n--- Advanced Cluster Visualizations ---")
 
-print(f"\n✅ Post-Generation Analysis Complete! Results saved to {out_dir}/ directory.")
+    n_samples = len(X)
+    if n_samples >= 3:
+        perplexity = min(30, max(1, (n_samples - 1) // 3))
+        print(f"Calculating t-SNE projection (perplexity={perplexity}, this may take a minute)...")
+        tsne_model = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_jobs=-1)
+        X_tsne = tsne_model.fit_transform(X)
+        df["tSNE_1"] = X_tsne[:, 0]
+        df["tSNE_2"] = X_tsne[:, 1]
 
-print("==================================================")
-print(" ✅ Post-Generation Analysis Complete!")
-print("==================================================")
+        plt.figure(figsize=(10, 8))
+        for i, ds in enumerate(unique_datasets):
+            sub = df[df["Dataset"] == ds]
+            plt.scatter(
+                sub["tSNE_1"],
+                sub["tSNE_2"],
+                label=f"{ds} (n={len(sub)})",
+                color=palette[i % len(palette)],
+                alpha=0.6,
+                s=15,
+            )
+        plt.legend(title="Dataset", bbox_to_anchor=(1.05, 1), loc="upper left")
+        plt.title("Multi-Trajectory t-SNE Projections by Origin Dataset")
+        plt.xlabel("t-SNE Dimension 1")
+        plt.ylabel("t-SNE Dimension 2")
+        tsne_cmp_path = os.path.join(out_dir, "tsne_dataset_comparison.png")
+        plt.savefig(tsne_cmp_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"Saved t-SNE Dataset Comparison Plot to {tsne_cmp_path}")
+        artifacts.append(tsne_cmp_path)
+
+        for cluster_col, title, out_name in [
+            ("Daura_Cluster", "Daura Clusters", "tsne_daura_plot.png"),
+            ("CNN_Cluster", "CNN/DBSCAN Clusters", "tsne_cnn_plot.png"),
+        ]:
+            if cluster_col in df.columns:
+                plt.figure(figsize=(10, 8))
+                scatter = plt.scatter(df["tSNE_1"], df["tSNE_2"], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
+                plt.colorbar(scatter, label=title)
+                plt.title(f"t-SNE Projection ({title})")
+                plt.xlabel("t-SNE Dimension 1")
+                plt.ylabel("t-SNE Dimension 2")
+                out_path = os.path.join(out_dir, out_name)
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                plt.close()
+                print(f"Saved t-SNE Graph to {out_path}")
+                artifacts.append(out_path)
+                methodology.append(f"Generated t-SNE non-linear projection for {title}.")
+    else:
+        print(f"⚠️ Skipping t-SNE: need at least 3 samples (got {n_samples}).")
+
+    if rmsd_matrix is not None:
+        print("Generating Cluster RMSD Heatmaps...")
+        for cluster_col, title, out_name in [
+            ("Daura_Cluster", "Daura", "daura_rmsd_heatmap.png"),
+            ("CNN_Cluster", "CNN/DBSCAN", "cnn_rmsd_heatmap.png"),
+        ]:
+            if cluster_col in df.columns:
+                sorted_idx = np.argsort(df[cluster_col].values)
+                step = max(1, len(sorted_idx) // 1000)
+                downsampled_idx = sorted_idx[::step]
+                sorted_dist = rmsd_matrix[np.ix_(downsampled_idx, downsampled_idx)]
+
+                plt.figure(figsize=(9, 8))
+                plt.imshow(sorted_dist, cmap="viridis_r", aspect="auto", interpolation="none")
+                plt.colorbar(label="RMSD (Å)")
+                plt.title(f"RMSD Pairwise Distance Matrix (Sorted by {title} Clusters)")
+                plt.xlabel("Frames (Sorted by Cluster)")
+                plt.ylabel("Frames (Sorted by Cluster)")
+                out_path = os.path.join(out_dir, out_name)
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                plt.close()
+                print(f"Saved RMSD Heatmap to {out_path}")
+                artifacts.append(out_path)
+                methodology.append(f"Generated RMSD pairwise distance block heatmap for {title} clusters.")
+
+    return artifacts
+
+
+def generate_pca_loadings(
+    pca_model: Any,
+    ref_bb_atoms: Any,
+    out_dir: str,
+) -> List[str]:
+    """Save pca_loadings.csv and pca_loadings_plot.png."""
+    n_atoms = len(ref_bb_atoms)
+    resids = ref_bb_atoms.resids
+    components = pca_model.components_
+
+    atom_contrib_pc1 = np.sqrt(np.sum(components[0].reshape(n_atoms, 3) ** 2, axis=1))
+    if components.shape[0] > 1:
+        atom_contrib_pc2 = np.sqrt(np.sum(components[1].reshape(n_atoms, 3) ** 2, axis=1))
+    else:
+        atom_contrib_pc2 = np.zeros(n_atoms, dtype=np.float64)
+
+    unique_resids, res_inv = np.unique(resids, return_inverse=True)
+    res_contrib_pc1 = np.bincount(res_inv, weights=atom_contrib_pc1)
+    res_contrib_pc2 = np.bincount(res_inv, weights=atom_contrib_pc2)
+
+    all_resids = np.arange(unique_resids.min(), unique_resids.max() + 1)
+    pc1_full = np.full(len(all_resids), np.nan)
+    pc2_full = np.full(len(all_resids), np.nan)
+
+    idx_arr = unique_resids - unique_resids.min()
+    pc1_full[idx_arr] = res_contrib_pc1
+    pc2_full[idx_arr] = res_contrib_pc2
+
+    csv_path = os.path.join(out_dir, "pca_loadings.csv")
+    pd.DataFrame({
+        "Residue": all_resids,
+        "PC1_Contribution": pc1_full,
+        "PC2_Contribution": pc2_full,
+    }).to_csv(csv_path, index=False)
+    print(f"Saved PCA Loadings data to {csv_path}")
+
+    plot_path = os.path.join(out_dir, "pca_loadings_plot.png")
+    plt.figure(figsize=(12, 5))
+    plt.plot(all_resids, pc1_full, label="PC1 Contribution", alpha=0.8, color="blue", marker=".", markersize=4)
+    plt.plot(all_resids, pc2_full, label="PC2 Contribution", alpha=0.8, color="orange", marker=".", markersize=4)
+    plt.xlabel("Residue Number")
+    plt.ylabel("Loading Magnitude (RMS)")
+    plt.title("Per-Residue Contribution to Principal Components")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved PCA Loadings Plot to {plot_path}")
+
+    return [csv_path, plot_path]
 EOF
+cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/reports.py"
+"""Text reports (cluster summary, methodology) and Stage 6 orchestration."""
 
-cp -f "$INSTALL_DIR/analyze_trajectory.py" "./analyze_trajectory.py" 2>/dev/null || true
+import os
+from typing import List
+import pandas as pd
+
+from metflow.models import StageResult, TrajectoryContext
+from metflow.stage6_visualization.dashboard import generate_dashboard
+from metflow.stage6_visualization.plots import (
+    generate_advanced_plots,
+    generate_cluster_plots,
+    generate_comparison_plots,
+    generate_pca_loadings,
+)
+
+
+def write_cluster_summary(df: pd.DataFrame, out_dir: str, unique_datasets: List[str]) -> str:
+    """Write dataset_cluster_summary.txt with per-dataset counts and cross-tabulations."""
+    summary_lines = [
+        "=== Multi-Trajectory Dataset Cluster Distribution Summary ===",
+        f"Total Datasets: {len(unique_datasets)}",
+        f"Total Frames: {len(df)}\n",
+    ]
+    for ds in unique_datasets:
+        ds_count = len(df[df["Dataset"] == ds])
+        summary_lines.append(f"Dataset '{ds}': {ds_count} frames ({ds_count / len(df) * 100:.1f}%)")
+
+    for cluster_col in ["PCA_KMeans_Cluster", "Daura_Cluster", "CNN_Cluster"]:
+        if cluster_col in df.columns:
+            summary_lines.append(f"\n--- Cross-Tabulation: {cluster_col} ---")
+            ct = pd.crosstab(df[cluster_col], df["Dataset"], margins=True)
+            ct_pct = pd.crosstab(df[cluster_col], df["Dataset"], normalize="index") * 100
+            summary_lines.append("Counts:")
+            summary_lines.append(ct.to_string())
+            summary_lines.append("\nRow Percentages (%):")
+            summary_lines.append(ct_pct.round(1).to_string())
+
+    out_path = os.path.join(out_dir, "dataset_cluster_summary.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    print(f"Saved dataset cluster summary report to {out_path}")
+    return out_path
+
+
+def write_methodology(methodology: List[str], out_dir: str) -> str:
+    """Write methodology.txt."""
+    out_path = os.path.join(out_dir, "methodology.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(methodology) + "\n")
+    print("Saved methodology.txt")
+    return out_path
+
+
+def run_stage6(ctx: TrajectoryContext) -> StageResult:
+    """Execute Stage 6: CSV export, HTML dashboard, plots, and text reports."""
+    config = ctx.config
+    out_dir = ctx.out_dir
+    var_explained = ctx.var_explained
+    artifacts: List[str] = []
+
+    print("\n--- Generating Final Outputs ---")
+    df = pd.DataFrame(ctx.df_data)
+    try:
+        df.rename(
+            columns={
+                "PCA_1": f"PCA_1 ({var_explained[0]:.1f}%)",
+                "PCA_2": f"PCA_2 ({var_explained[1]:.1f}%)",
+                "PCA_3": f"PCA_3 ({var_explained[2]:.1f}%)",
+            },
+            inplace=True,
+        )
+    except Exception:
+        pass
+    ctx.df = df
+
+    csv_path = os.path.join(out_dir, "global_cluster_metrics.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved complete metrics to {csv_path}")
+    artifacts.append(csv_path)
+
+    dash_path = generate_dashboard(out_dir, df=df)
+    print(f"🌟 Generated interactive Dashboard (with embedded data for zero-CORS offline browsing!): {dash_path}")
+    artifacts.append(dash_path)
+
+    cmp_artifacts, unique_datasets, palette = generate_comparison_plots(df, out_dir)
+    artifacts.extend(cmp_artifacts)
+
+    if config.is_only_energy:
+        artifacts.append(write_methodology(ctx.methodology, out_dir))
+        print("==================================================")
+        print(" ✅ Option [C] Energy ONLY Evaluation Complete!")
+        print("==================================================")
+        return StageResult(
+            stage_name="stage6_visualization",
+            success=True,
+            exit_code=0,
+            artifacts=artifacts,
+            metrics={"only_energy": True, "n_frames": len(df)},
+        )
+
+    artifacts.append(write_cluster_summary(df, out_dir, unique_datasets))
+    artifacts.extend(generate_cluster_plots(df, out_dir, var_explained))
+
+    if config.is_advanced_plots:
+        artifacts.extend(
+            generate_advanced_plots(
+                df, ctx.X, ctx.rmsd_matrix, out_dir, unique_datasets, palette, ctx.methodology
+            )
+        )
+
+    artifacts.extend(generate_pca_loadings(ctx.pca_model, ctx.ref_bb_atoms, out_dir))
+    artifacts.append(write_methodology(ctx.methodology, out_dir))
+
+    print(f"\n✅ Post-Generation Analysis Complete! Results saved to {out_dir}/ directory.")
+    print("==================================================")
+    print(" ✅ Post-Generation Analysis Complete!")
+    print("==================================================")
+
+    return StageResult(
+        stage_name="stage6_visualization",
+        success=True,
+        exit_code=0,
+        artifacts=artifacts,
+        metrics={"n_frames": len(df), "n_datasets": len(unique_datasets)},
+    )
+EOF
+# METFLOW_MODULES_END
 
 # ----- BASH WRAPPER: metflow -----
 cat << 'EOF' > "$INSTALL_DIR/bin/metflow"
@@ -2924,6 +4165,15 @@ set -e
 SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || readlink -f "$BASH_SOURCE")
 BIN_DIR=$(dirname "$SCRIPT_PATH")
 INSTALL_DIR=$(dirname "$BIN_DIR")
+if [ ! -f "$INSTALL_DIR/analyze_trajectory.py" ]; then
+    if [ -f "./analyze_trajectory.py" ]; then
+        INSTALL_DIR="$(pwd)"
+    elif [ -f "$BIN_DIR/analyze_trajectory.py" ]; then
+        INSTALL_DIR="$BIN_DIR"
+    elif [ -f "$HOME/metflow_pipeline/analyze_trajectory.py" ]; then
+        INSTALL_DIR="$HOME/metflow_pipeline"
+    fi
+fi
 MAMBA_BIN=$(command -v micromamba || echo "$HOME/.local/bin/micromamba")
 
 eval "$("$MAMBA_BIN" shell hook --shell=bash)"
