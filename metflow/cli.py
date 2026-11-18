@@ -126,8 +126,9 @@ def parse_args_to_config(
 
 
 def save_params(config: PipelineConfig, out_dir: str, base_dir: str = ".") -> str:
-    """Save run parameters to out_dir/metflow_params.txt (and cwd if different)."""
-    os.makedirs(out_dir, exist_ok=True)
+    """Save run parameters to out_dir/registers/metflow_params.txt without polluting cwd."""
+    reg_dir = os.path.join(out_dir, "registers")
+    os.makedirs(reg_dir, exist_ok=True)
     param_keys = [
         "skim", "equator", "top", "bottom", "min_vol", "cluster", "k",
         "rmsd", "cnn_eps", "allostery", "cavity_res", "loop_res", "pca_res",
@@ -136,15 +137,7 @@ def save_params(config: PipelineConfig, out_dir: str, base_dir: str = ".") -> st
         "only_energy", "only_dashboard", "max_frames", "min_steps", "pca_ref",
     ]
     param_str = "\n".join(f"{k}={getattr(config, k)}" for k in param_keys) + "\n"
-    out_param_path = os.path.join(out_dir, "metflow_params.txt")
+    out_param_path = os.path.join(reg_dir, "metflow_params.txt")
     with open(out_param_path, "w", encoding="utf-8") as f_param:
         f_param.write(param_str)
-
-    base_dir_abs = os.path.abspath(base_dir)
-    if os.path.abspath(out_dir) != base_dir_abs:
-        try:
-            with open(os.path.join(base_dir_abs, "metflow_params.txt"), "w", encoding="utf-8") as f_param2:
-                f_param2.write(param_str)
-        except Exception:
-            pass
     return out_param_path

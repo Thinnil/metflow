@@ -540,8 +540,9 @@ def parse_args_to_config(
 
 
 def save_params(config: PipelineConfig, out_dir: str, base_dir: str = ".") -> str:
-    """Save run parameters to out_dir/metflow_params.txt (and cwd if different)."""
-    os.makedirs(out_dir, exist_ok=True)
+    """Save run parameters to out_dir/registers/metflow_params.txt without polluting cwd."""
+    reg_dir = os.path.join(out_dir, "registers")
+    os.makedirs(reg_dir, exist_ok=True)
     param_keys = [
         "skim", "equator", "top", "bottom", "min_vol", "cluster", "k",
         "rmsd", "cnn_eps", "allostery", "cavity_res", "loop_res", "pca_res",
@@ -550,17 +551,9 @@ def save_params(config: PipelineConfig, out_dir: str, base_dir: str = ".") -> st
         "only_energy", "only_dashboard", "max_frames", "min_steps", "pca_ref",
     ]
     param_str = "\n".join(f"{k}={getattr(config, k)}" for k in param_keys) + "\n"
-    out_param_path = os.path.join(out_dir, "metflow_params.txt")
+    out_param_path = os.path.join(reg_dir, "metflow_params.txt")
     with open(out_param_path, "w", encoding="utf-8") as f_param:
         f_param.write(param_str)
-
-    base_dir_abs = os.path.abspath(base_dir)
-    if os.path.abspath(out_dir) != base_dir_abs:
-        try:
-            with open(os.path.join(base_dir_abs, "metflow_params.txt"), "w", encoding="utf-8") as f_param2:
-                f_param2.write(param_str)
-        except Exception:
-            pass
     return out_param_path
 EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/deps.py"
@@ -2540,7 +2533,9 @@ def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, L
                 resnames[i] = "MET"
         u_heavy.residues.resnames = resnames
 
-        tmp_pdb = os.path.join(out_dir, "tmp_clean_heavy.pdb")
+        tmp_dir = os.path.join(out_dir, "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_pdb = os.path.join(tmp_dir, "tmp_clean_heavy.pdb")
         u_heavy.write(tmp_pdb)
 
         print("  -> Initializing OpenMM with amber14/obc2 implicit solvent...")
@@ -4622,14 +4617,22 @@ run_analysis() {
     echo "   MET Pipeline Analysis & Clustering Menu"
     echo "================================================="
     
-    PARAM_FILE="metflow_params.txt"
+    PARAM_FILE=""
+    CHECK_OUT_DIR="${CUSTOM_OUT:-clustering_results}"
+    if [ -f "$CHECK_OUT_DIR/registers/metflow_params.txt" ]; then
+        PARAM_FILE="$CHECK_OUT_DIR/registers/metflow_params.txt"
+    elif [ -f "metflow_params.txt" ]; then
+        PARAM_FILE="metflow_params.txt"
+    else
+        PARAM_FILE=$(find . -maxdepth 3 -path "*/registers/metflow_params.txt" 2>/dev/null | head -n 1 || true)
+    fi
     LOAD_PREV=false
 
     if [ "$2" == "true" ]; then
         OUT_DIR_VAL="${CUSTOM_OUT:-clustering_results}"
         validate_out_dir "$OUT_DIR_VAL"
         CMD_ARGS=(--only_dashboard "true" --out_dir "$OUT_DIR_VAL")
-        mkdir -p "$OUT_DIR_VAL"
+        mkdir -p "$OUT_DIR_VAL/registers"
         PARAM_CONTENT="max_frames=0
 skim=false
 cluster=none
@@ -4645,8 +4648,7 @@ out_dir=${OUT_DIR_VAL}
 multi_datasets=${IS_MULTI_DATASET:-false}
 only_energy=false
 only_dashboard=true"
-        echo "$PARAM_CONTENT" > "$PARAM_FILE"
-        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/$PARAM_FILE"
+        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/registers/metflow_params.txt"
 
         TARGET_SCRIPT="$INSTALL_DIR/analyze_trajectory.py"
         if [ -f "./analyze_trajectory.py" ]; then
@@ -4659,7 +4661,7 @@ only_dashboard=true"
         exit 0
     fi
 
-    if [ "$1" != "true" ] && [ "$2" != "true" ] && [ -f "$PARAM_FILE" ]; then
+    if [ "$1" != "true" ] && [ "$2" != "true" ] && [ -n "$PARAM_FILE" ] && [ -f "$PARAM_FILE" ]; then
         echo "⚠️ Found existing parameter file: $PARAM_FILE"
         echo "  [1] Start New Analysis (Interactive Prompt) [DEFAULT]"
         echo "  [2] Load Previous Parameters (from $PARAM_FILE)"
@@ -4740,7 +4742,7 @@ only_dashboard=true"
             CMD_ARGS+=(--multi_datasets "$IS_MULTI_DATASET")
         fi
 
-        mkdir -p "$OUT_DIR_VAL"
+        mkdir -p "$OUT_DIR_VAL/registers"
         PARAM_CONTENT="max_frames=${max_frames_input:-0}
 skim=${SKIM_VAL}
 cluster=${CLUSTER_OPT}
@@ -4757,8 +4759,7 @@ out_dir=${OUT_DIR_VAL}
 multi_datasets=${IS_MULTI_DATASET:-false}
 only_energy=${ONLY_ENERGY_VAL}
 only_dashboard=${ONLY_DASHBOARD_VAL}"
-        echo "$PARAM_CONTENT" > "$PARAM_FILE"
-        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/$PARAM_FILE"
+        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/registers/metflow_params.txt"
     else
         echo ""
         echo "[Downsampling] Processing thousands of frames takes a long time."
@@ -4850,7 +4851,7 @@ only_dashboard=${ONLY_DASHBOARD_VAL}"
         ONLY_ENERGY_VAL="false"
         ONLY_DASHBOARD_VAL="false"
 
-        mkdir -p "$OUT_DIR_VAL"
+        mkdir -p "$OUT_DIR_VAL/registers"
         PARAM_CONTENT="max_frames=${max_frames_input:-0}
 skim=${SKIM_VAL}
 cluster=${CLUSTER_OPT}
@@ -4867,8 +4868,7 @@ out_dir=${OUT_DIR_VAL}
 multi_datasets=${IS_MULTI_DATASET:-false}
 only_energy=${ONLY_ENERGY_VAL}
 only_dashboard=${ONLY_DASHBOARD_VAL}"
-        echo "$PARAM_CONTENT" > "$PARAM_FILE"
-        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/$PARAM_FILE"
+        echo "$PARAM_CONTENT" > "$OUT_DIR_VAL/registers/metflow_params.txt"
     fi
 
     TARGET_SCRIPT="$INSTALL_DIR/analyze_trajectory.py"
@@ -4881,7 +4881,9 @@ only_dashboard=${ONLY_DASHBOARD_VAL}"
     echo ""
     read -r -p "Run analysis in the BACKGROUND (nohup ... &)? [y/N]: " bg_run_choice
     if [[ "$bg_run_choice" =~ ^[Yy]$ ]]; then
-        LOG_OUT="metflow_analysis.log"
+        LOG_DIR="${OUT_DIR_VAL:-clustering_results}/logs"
+        mkdir -p "$LOG_DIR"
+        LOG_OUT="$LOG_DIR/metflow_analysis.log"
         nohup micromamba run -n conf_sel_analysis python "$TARGET_SCRIPT" "${CMD_ARGS[@]}" < /dev/null > "$LOG_OUT" 2>&1 &
         BG_PID=$!
         disown "$BG_PID" 2>/dev/null || true

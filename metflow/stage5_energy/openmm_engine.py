@@ -136,7 +136,9 @@ def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, L
                 resnames[i] = "MET"
         u_heavy.residues.resnames = resnames
 
-        tmp_pdb = os.path.join(out_dir, "tmp_clean_heavy.pdb")
+        tmp_dir = os.path.join(out_dir, "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_pdb = os.path.join(tmp_dir, "tmp_clean_heavy.pdb")
         u_heavy.write(tmp_pdb)
 
         print("  -> Initializing OpenMM with amber14/obc2 implicit solvent...")
