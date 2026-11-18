@@ -107,6 +107,36 @@ class TestStage1AndStage2(unittest.TestCase):
         self.assertEqual(len(all_sampled), 10)
         self.assertEqual(len(all_tags), 10)
 
+    def test_heavy_atom_exclusion_expr_handles_missing_elements(self):
+        from metflow.stage1_ingestion.indexing import heavy_atom_exclusion_expr
+
+        class TopoNoElements:
+            types = ["C", "N"]
+
+        class TopoBare:
+            pass
+
+        class TopoFull:
+            types = ["C"]
+            elements = ["C"]
+
+        class DummyUniverse:
+            def __init__(self, topo):
+                self._topology = topo
+
+        expr_no_elem = heavy_atom_exclusion_expr(DummyUniverse(TopoNoElements()))
+        self.assertNotIn("element H", expr_no_elem)
+        self.assertIn("type H", expr_no_elem)
+
+        expr_bare = heavy_atom_exclusion_expr(DummyUniverse(TopoBare()))
+        self.assertNotIn("element H", expr_bare)
+        self.assertNotIn("type H", expr_bare)
+        self.assertIn("name H*", expr_bare)
+
+        expr_full = heavy_atom_exclusion_expr(DummyUniverse(TopoFull()))
+        self.assertIn("element H", expr_full)
+        self.assertIn("type H", expr_full)
+
 
 if __name__ == "__main__":
     unittest.main()

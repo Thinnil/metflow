@@ -8,6 +8,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MET Flow - Art Nouveau Dashboard</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
@@ -32,7 +33,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         #pymol-code { background: #000; color: #0f0; padding: 15px; border-radius: 5px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }
         .close-btn { background: var(--gold); color: var(--dark-green); border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; margin-top: 15px; border-radius: 5px;}
         .overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.55); z-index: 999; backdrop-filter: blur(2px); }
-        
+
         /* Interactive Image Customization & Export Modal */
         #export-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #ffffff; color: var(--text-color); padding: 25px 30px; border: 3px solid var(--gold); border-radius: 16px; z-index: 1001; box-shadow: 0 15px 45px rgba(0,0,0,0.45); width: 92%; max-width: 820px; max-height: 90vh; overflow-y: auto; font-family: 'Lato', sans-serif; }
         #export-modal h2 { font-family: 'Playfair Display', serif; color: var(--dark-green); margin: 0 0 15px 0; border-bottom: 2px solid var(--gold); padding-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
@@ -53,6 +54,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-download:hover { filter: brightness(1.1); }
         .btn-cancel { background: #e2e8f0; color: #4a5568; border: none; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.92em; }
         .btn-cancel:hover { background: #cbd5e1; }
+        .modal-close-icon { background: transparent; border: 1px solid var(--gold); color: var(--dark-green); border-radius: 4px; cursor: pointer; font-size: 0.9em; padding: 4px 8px; }
+        .modal-close-icon:hover { background: var(--bg-color); }
+        #status-banner { display: none; padding: 10px 14px; border-radius: 6px; font-size: 0.9em; font-weight: 600; border: 1px solid var(--gold); background: #edf7ed; color: #1b3a30; }
+        #status-banner.warning { background: #fef3c7; color: #78350f; border-color: #d97706; }
+        .file-drop:focus, button:focus, select:focus, input:focus { outline: 2px solid var(--dark-green); outline-offset: 2px; }
+        @media (max-width: 900px) {
+            body { height: auto; }
+            .container { flex-direction: column; overflow: visible; }
+            .sidebar { width: auto; }
+        }
     </style>
 </head>
 <body>
@@ -61,46 +72,54 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="font-style: italic;">Thermodynamic & Conformational Analytics</div>
     </header>
     <div class="container">
-        <div class="sidebar">
+        <aside class="sidebar" aria-label="Controls and Data Ingestion">
             <h2>Data Ingestion</h2>
-            <div class="file-drop" id="drop-zone">
+            <div class="file-drop" id="drop-zone" tabindex="0" role="button" aria-label="Drop CSV files here or press Enter to browse">
                 Drop <b>global_cluster_metrics.csv</b>, <b>energy_checkpoint.csv</b>, or <b>pca_loadings.csv</b> here
-                <input type="file" id="file-input" style="display: none;" accept=".csv" multiple>
+                <input type="file" id="file-input" style="display: none;" accept=".csv" multiple aria-label="Upload CSV files">
             </div>
-            <button class="export-btn" onclick="exportCSV()">💾 Export Merged CSV</button>
-            <button class="export-btn" onclick="openExportModal()" style="margin-top: 10px; background: #1b3a30; color: #d4af37; border: 1px solid #d4af37;">🎨 Customize & Export Image</button>
+            <div id="status-banner" role="status" aria-live="polite"></div>
+            <button type="button" class="export-btn" onclick="exportCSV()">💾 Export Merged CSV</button>
+            <button type="button" class="export-btn" onclick="openExportModal()" style="margin-top: 10px; background: #1b3a30; color: #d4af37; border: 1px solid #d4af37;">🎨 Customize & Export Image</button>
             <h2>Plot Controls</h2>
-            <label>Filter Dataset: <select id="sel-filter-dataset" onchange="updatePlots()">
+            <label for="sel-filter-dataset">Filter Dataset:</label>
+            <select id="sel-filter-dataset" aria-label="Filter Dataset" onchange="updatePlots()">
                 <option value="all" selected>All Datasets (Combined)</option>
-            </select></label>
-            <label>X-Axis: <select id="sel-x"></select></label>
-            <label>Y-Axis: <select id="sel-y"></select></label>
-            <label>Z-Axis (3D): <select id="sel-z"><option value="none">None (2D Plot)</option></select></label>
-            <label>Color By: <select id="sel-color"></select></label>
+            </select>
+            <label for="sel-x">X-Axis:</label>
+            <select id="sel-x" aria-label="X-Axis"></select>
+            <label for="sel-y">Y-Axis:</label>
+            <select id="sel-y" aria-label="Y-Axis"></select>
+            <label for="sel-z">Z-Axis (3D):</label>
+            <select id="sel-z" aria-label="Z-Axis (3D)"><option value="none">None (2D Plot)</option></select>
+            <label for="sel-color">Color By:</label>
+            <select id="sel-color" aria-label="Color By"></select>
             <div id="color-mode-container" style="margin-top:8px;">
-                <label>Coloring Mode: <select id="sel-color-mode" onchange="updatePlots()">
+                <label for="sel-color-mode">Coloring Mode:</label>
+                <select id="sel-color-mode" aria-label="Coloring Mode" onchange="updatePlots()">
                     <option value="binned" selected>Interval Ranges (Box-Plot with Outliers)</option>
                     <option value="continuous">Continuous Gradient</option>
-                </select></label>
+                </select>
             </div>
             <div id="colorscale-container" style="display:none; margin-top:8px;">
-                <label>Colorscale: <select id="sel-colorscale" onchange="updatePlots()">
+                <label for="sel-colorscale">Colorscale:</label>
+                <select id="sel-colorscale" aria-label="Colorscale" onchange="updatePlots()">
                     <option value="Viridis">Viridis</option>
                     <option value="Plasma">Plasma</option>
                     <option value="Inferno">Inferno</option>
                     <option value="Jet">Jet</option>
                     <option value="RdBu">Red-Blue (RdBu)</option>
-                </select></label>
+                </select>
             </div>
             <div style="margin-top: 15px;">
-                <label style="display:flex; align-items:center; gap: 8px;">
-                    <input type="checkbox" id="filter-energy" onchange="updatePlots()"> Only show frames with Energy data
+                <label for="filter-energy" style="display:flex; align-items:center; gap: 8px;">
+                    <input type="checkbox" id="filter-energy" aria-label="Only show frames with Energy data" onchange="updatePlots()"> Only show frames with Energy data
                 </label>
             </div>
-        </div>
-        <div class="main-content">
+        </aside>
+        <main class="main-content">
             <div class="plot-container" id="main-plot" style="height: 85vh; min-height: 700px; position: relative;">
-                <div id="main-plot-placeholder" style="position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #888; pointer-events: none; z-index: 1;">
+                <div id="main-plot-placeholder" style="position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #595959; pointer-events: none; z-index: 1;">
                     <div style="font-size: 1.3em; font-family: 'Playfair Display', serif; color: #1b3a30; margin-bottom: 8px;">Awaiting Trajectory Data</div>
                     <div>Drag & drop <b>global_cluster_metrics.csv</b> or wait for sample metrics to render.</div>
                 </div>
@@ -108,26 +127,26 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="plot-container" id="loadings-plot" style="display: none; height: 400px;"></div>
             <div style="display: flex; gap: 20px;">
                 <div class="plot-container" id="timeseries-plot" style="flex: 1; height: 400px; overflow:hidden;">
-                    <div style="text-align:center; padding: 100px; color: #888;">No Energy Data Found.<br><br>Drag & drop <b>energy_checkpoint.csv</b> to dynamically merge and visualize energy!</div>
+                    <div style="text-align:center; padding: 100px; color: #595959;">No Energy Data Found.<br><br>Drag & drop <b>energy_checkpoint.csv</b> to dynamically merge and visualize energy (kcal/mol)!</div>
                 </div>
                 <div class="plot-container" id="hist-plot" style="flex: 1; height: 400px;"></div>
             </div>
-        </div>
+        </main>
     </div>
     <div class="overlay" id="overlay" onclick="closeModal()"></div>
-    <div id="pymol-modal">
-        <h3>Frame Selected!</h3>
-        <p>Frame ID: <span id="modal-frame"></span> | Cluster/Color: <span id="modal-cluster"></span> | Energy: <span id="modal-energy"></span></p>
+    <div id="pymol-modal" role="dialog" aria-modal="true" aria-labelledby="pymol-modal-title">
+        <h3 id="pymol-modal-title">Frame Selected!</h3>
+        <p>Frame ID: <span id="modal-frame"></span> | Cluster/Color: <span id="modal-cluster"></span> | Energy (kcal/mol): <span id="modal-energy"></span></p>
         <p>To extract this frame in PyMOL on your server, copy and paste this command:</p>
         <div id="pymol-code"></div>
-        <button class="close-btn" onclick="closeModal()">Close</button>
+        <button type="button" class="close-btn" onclick="closeModal()">Close</button>
     </div>
 
     <!-- Export & Styling Customization Modal -->
-    <div id="export-modal">
-        <h2>
+    <div id="export-modal" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">
+        <h2 id="export-modal-title">
             <span>🎨 Customize Image & Export</span>
-            <span style="cursor: pointer; font-size: 0.9em;" onclick="closeModal()">✖</span>
+            <button type="button" class="modal-close-icon" aria-label="Close export modal" onclick="closeModal()">✖</button>
         </h2>
         <div class="modal-grid">
             <!-- Section 1: Typography & Labels -->
@@ -282,19 +301,54 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         let cols = [];
         let pendingFiles = [];
         let mergeTimeout = null;
-        
+
+        function showStatus(message, isWarning = false) {
+            const banner = document.getElementById('status-banner');
+            if (!banner) return;
+            if (!message) {
+                banner.style.display = 'none';
+                banner.innerText = '';
+                banner.classList.remove('warning');
+                return;
+            }
+            banner.innerText = message;
+            banner.classList.toggle('warning', Boolean(isWarning));
+            banner.style.display = 'block';
+        }
+
+        function formatAxisLabel(col) {
+            if (!col) return '';
+            const lower = col.toLowerCase();
+            if (lower.includes('rmsd') && !lower.includes('å') && !lower.includes('angstrom')) {
+                return `${col} (Å)`;
+            }
+            if (lower.includes('energy') && !lower.includes('kcal')) {
+                return `${col} (kcal/mol)`;
+            }
+            return col;
+        }
+
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
-        
+
         dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                fileInput.click();
+            }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
         dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.background = '#e8e4d8'; });
         dropZone.addEventListener('dragleave', () => dropZone.style.background = '');
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault(); dropZone.style.background = '';
             Array.from(e.dataTransfer.files).forEach(f => processFile(f));
         });
-        fileInput.addEventListener('change', (e) => { 
-            Array.from(e.target.files).forEach(f => processFile(f)); 
+        fileInput.addEventListener('change', (e) => {
+            Array.from(e.target.files).forEach(f => processFile(f));
         });
 
         window.addEventListener('DOMContentLoaded', () => {
@@ -322,7 +376,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     }});
                 }).catch(() => {});
         });
-        
+
         function processFile(file) {
             const ph = document.getElementById('main-plot-placeholder');
             if (ph) { ph.style.display = 'none'; ph.remove(); }
@@ -330,13 +384,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 complete: function(results) {
                     if (results.meta.fields.includes('Residue') && results.meta.fields.includes('PC1_Contribution')) {
                         globalLoadings = results.data;
-                        alert("✅ Loaded PCA Loadings Data!");
+                        showStatus("✅ Loaded PCA Loadings Data!");
                         updatePlots();
                         return;
                     }
-                    
+
                     pendingFiles.push(results);
-                    
+
                     clearTimeout(mergeTimeout);
                     mergeTimeout = setTimeout(() => {
                         if (pendingFiles.length > 0) mergePendingFiles();
@@ -344,13 +398,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 }
             });
         }
-        
+
         function mergePendingFiles() {
             pendingFiles.sort((a, b) => b.data.length - a.data.length);
-            
+
             pendingFiles.forEach(results => {
                 let rCols = results.meta.fields;
-                
+
                 if(rCols.includes('Energy_kcal_mol') && !rCols.includes('OpenMM_Energy_kcal_mol')) {
                     results.data.forEach(d => d['OpenMM_Energy_kcal_mol'] = d['Energy_kcal_mol']);
                     rCols.push('OpenMM_Energy_kcal_mol');
@@ -359,19 +413,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     results.data.forEach(d => d['OpenMM_Energy_kcal_mol'] = d['Energy']);
                     rCols.push('OpenMM_Energy_kcal_mol');
                 }
-                
+
                 if (globalData.length === 0) {
-                    globalData = results.data; 
+                    globalData = results.data;
                     cols = rCols;
                 } else {
                     let newCols = rCols.filter(c => !cols.includes(c));
                     if (newCols.length > 0) {
                         let dataMap = new Map();
-                        results.data.forEach(d => { 
+                        results.data.forEach(d => {
                             let df = (d['Frame'] !== undefined) ? d['Frame'] : d['Frame_Index'];
-                            if (df !== undefined) dataMap.set(df, d); 
+                            if (df !== undefined) dataMap.set(df, d);
                         });
-                        
+
                         globalData.forEach(g => {
                             let f = (g['Frame'] !== undefined) ? g['Frame'] : g['Frame_Index'];
                             if (dataMap.has(f)) {
@@ -380,16 +434,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                             }
                         });
                         cols = [...cols, ...newCols];
-                        alert("✅ Successfully merged new dataset into existing plots!");
+                        showStatus("✅ Successfully merged new dataset into existing plots!");
                     }
                 }
             });
-            
+
             pendingFiles = [];
-            populateDropdowns(); 
+            populateDropdowns();
             updatePlots();
         }
-        
+
         function exportCSV() {
             if(globalData.length === 0) return;
             const csv = Papa.unparse(globalData);
@@ -403,7 +457,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             link.click();
             document.body.removeChild(link);
         }
-        
+
         function populateDropdowns() {
             const sels = ['sel-x', 'sel-y', 'sel-z', 'sel-color'];
             const prevVals = {};
@@ -415,7 +469,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 const el = document.getElementById(id);
                 if(id !== 'sel-z') el.innerHTML = '';
                 else el.innerHTML = '<option value="none">None (2D Plot)</option>';
-                cols.forEach(c => { el.innerHTML += `<option value="${c}">${c}</option>`; });
+                cols.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = c;
+                    opt.textContent = c;
+                    el.appendChild(opt);
+                });
             });
 
             const pc1_col = cols.find(c => c.startsWith('PCA_1'));
@@ -459,12 +518,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 selColor.value = 'PCA_KMeans_Cluster';
             }
         }
-        
-        ['sel-x', 'sel-y', 'sel-z', 'sel-color', 'sel-filter-dataset'].forEach(id => { 
+
+        ['sel-x', 'sel-y', 'sel-z', 'sel-color', 'sel-filter-dataset'].forEach(id => {
             const el = document.getElementById(id);
-            if (el) el.addEventListener('change', updatePlots); 
+            if (el) el.addEventListener('change', updatePlots);
         });
-        
+
         let customSettings = {
             title: 'Structural Landscape',
             fontFamily: 'Playfair Display, Georgia, serif',
@@ -488,63 +547,68 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             format: 'png'
         };
 
+        function parseVal(v) {
+            if (v === null || v === undefined) return null;
+            if (typeof v === 'number') return (isNaN(v) || !isFinite(v)) ? null : v;
+            let s = String(v).trim();
+            if (s === '' || s.toLowerCase() === 'null' || s.toLowerCase() === 'nan' || s.toLowerCase() === 'n/a' || s.toLowerCase() === 'undefined') return null;
+            let n = parseFloat(s);
+            return (isNaN(n) || !isFinite(n)) ? null : n;
+        }
+
         function updatePlots() {
             if(globalLoadings.length > 0) {
                 document.getElementById('loadings-plot').style.display = 'block';
                 Plotly.react('loadings-plot', [
                     { x: globalLoadings.map(d=>d.Residue), y: globalLoadings.map(d=>d.PC1_Contribution), name: 'PC1', type: 'scatter', mode: 'lines+markers', line: {color: '#1b3a30'} },
                     { x: globalLoadings.map(d=>d.Residue), y: globalLoadings.map(d=>d.PC2_Contribution), name: 'PC2', type: 'scatter', mode: 'lines+markers', line: {color: '#d4af37'} }
-                ], { title: {text: 'PCA Loadings (Residue Contribution)', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Residue Number'}, yaxis: {title: 'Loading Magnitude'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
+                ], { title: {text: 'PCA Loadings (Residue Contribution)', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Residue Number'}, yaxis: {title: 'Loading Magnitude (RMS, Å)'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
             }
-            
+
             if(!globalData.length) return;
             const ph = document.getElementById('main-plot-placeholder');
             if (ph) { ph.style.display = 'none'; ph.remove(); }
-            
+
             let plotData = globalData;
             const selDataset = document.getElementById('sel-filter-dataset') ? document.getElementById('sel-filter-dataset').value : 'all';
             if (selDataset && selDataset !== 'all' && cols.includes('Dataset')) {
                 plotData = plotData.filter(d => d['Dataset'] === selDataset);
             }
             if(document.getElementById('filter-energy') && document.getElementById('filter-energy').checked && cols.includes('OpenMM_Energy_kcal_mol')) {
-                plotData = plotData.filter(d => d['OpenMM_Energy_kcal_mol'] !== undefined && d['OpenMM_Energy_kcal_mol'] !== null && d['OpenMM_Energy_kcal_mol'] !== '');
+                plotData = plotData.filter(d => parseVal(d['OpenMM_Energy_kcal_mol']) !== null);
             }
-            if(!plotData.length) plotData = globalData;
-            
+            if(!plotData.length) {
+                showStatus("⚠️ No frames match the current filter criteria (0 matches).", true);
+                Plotly.react('main-plot', [], { title: { text: 'No matching frames for current filter', font: { family: customSettings.fontFamily, color: customSettings.fontColor } } }, { responsive: true });
+                return;
+            }
+            showStatus('');
+
             const cx = document.getElementById('sel-x').value;
             const cy = document.getElementById('sel-y').value;
             const cz = document.getElementById('sel-z').value;
             const cColor = document.getElementById('sel-color').value;
             const cScale = document.getElementById('sel-colorscale') ? document.getElementById('sel-colorscale').value : 'Viridis';
-            
+
             const x = plotData.map(d => d[cx]);
             const y = plotData.map(d => d[cy]);
             const color = plotData.map(d => d[cColor]);
             const frames = plotData.map(d => (d['Frame'] !== undefined) ? d['Frame'] : d['Frame_Index']);
             const hovertext = plotData.map(d => `Frame: ${(d['Frame'] !== undefined) ? d['Frame'] : d['Frame_Index']}<br>${cColor}: ${d[cColor]}${d['Dataset'] ? '<br>Dataset: ' + d['Dataset'] : ''}`);
-            
+
             const colorMode = document.getElementById('sel-color-mode') ? document.getElementById('sel-color-mode').value : 'binned';
             const csContainer = document.getElementById('colorscale-container');
             const cmContainer = document.getElementById('color-mode-container');
 
-            function parseVal(v) {
-                if (v === null || v === undefined) return null;
-                if (typeof v === 'number') return isNaN(v) ? null : v;
-                let s = String(v).trim();
-                if (s === '' || s.toLowerCase() === 'null' || s.toLowerCase() === 'nan' || s.toLowerCase() === 'n/a' || s.toLowerCase() === 'undefined') return null;
-                let n = parseFloat(s);
-                return isNaN(n) ? null : n;
-            }
-
             let numericVals = color.map(v => parseVal(v));
             let validNums = numericVals.filter(v => v !== null);
             let validCount = validNums.length;
-            
+
             const isEnergy = cColor.toLowerCase().includes('energy');
             const isExplicitCategory = ['dataset', 'cluster', 'label', 'method'].some(k => cColor.toLowerCase().includes(k));
             const uniqueValCount = new Set(color.map(v => (v === null || v === undefined) ? '' : String(v).trim())).size;
             const isCategory = isExplicitCategory || (!isEnergy && !['pca', 'rmsd', 'tsne', 'loading'].some(k => cColor.toLowerCase().includes(k)) && uniqueValCount <= 40);
-            
+
             if (isCategory) {
                 if (cmContainer) cmContainer.style.display = 'none';
                 if (csContainer) csContainer.style.display = 'none';
@@ -557,7 +621,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             }
 
             let traces = [];
-            
+
             if (isCategory && color.length > 0) {
                 const catPalette = [
                     '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -590,7 +654,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: indices.map(i => plotData[i])
                     };
-                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = indices.map(i => plotData[i][cz]); } 
+                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = indices.map(i => plotData[i][cz]); }
                     else { trace.type = 'scatter'; }
                     traces.push(trace);
                 });
@@ -606,18 +670,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: plotData
                     };
-                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = plotData.map(d => d[cz]); } 
+                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = plotData.map(d => d[cz]); }
                     else { trace.type = 'scatter'; }
                     traces.push(trace);
                 } else {
                     const sorted = [...validNums].sort((a, b) => a - b);
                     const nValid = sorted.length;
-                    
+
                     const q1 = sorted[Math.floor(nValid * 0.25)];
                     const med = sorted[Math.floor(nValid * 0.50)];
                     const q3 = sorted[Math.floor(nValid * 0.75)];
                     const iqr = q3 - q1;
-                    
+
                     // For energy or skewed metrics, calculate robust cutoff
                     const p90 = sorted[Math.floor(nValid * 0.90)];
                     let highCutoff = (iqr > 0) ? (q3 + 1.5 * iqr) : p90;
@@ -627,19 +691,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         if (highCutoff > 2000 && q3 < 2000) highCutoff = Math.max(q3, 1500);
                     }
                     let lowCutoff = (iqr > 0) ? (q1 - 1.5 * iqr) : sorted[0];
-                    
+
                     const repVals = sorted.filter(v => v >= lowCutoff && v <= highCutoff);
                     const repMin = repVals.length > 0 ? repVals[0] : sorted[0];
                     const repMax = repVals.length > 0 ? repVals[repVals.length - 1] : highCutoff;
                     const nRep = repVals.length;
-                    
+
                     const b1 = repVals[Math.floor(nRep * 0.20)] || repMin;
                     const b2 = repVals[Math.floor(nRep * 0.40)] || b1;
                     const b3 = repVals[Math.floor(nRep * 0.60)] || b2;
                     const b4 = repVals[Math.floor(nRep * 0.80)] || b3;
-                    
+
                     const colors = ['#059669', '#0d9488', '#0284c7', '#d97706', '#dc2626'];
-                    
+
                     let hasLowOutliers = (lowCutoff > sorted[0]);
                     let buckets = [];
                     if (hasLowOutliers) {
@@ -654,7 +718,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         { name: `⚫ High Outliers / Clashes (> ${highCutoff.toFixed(1)})`, color: '#111111', indices: [] },
                         { name: `❌ Clashes / NaN`, color: '#4b5563', indices: [] }
                     );
-                    
+
                     const offset = hasLowOutliers ? 1 : 0;
                     for (let i = 0; i < plotData.length; i++) {
                         const val = numericVals[i];
@@ -676,7 +740,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                             buckets[offset + 4].indices.push(i);
                         }
                     }
-                    
+
                     buckets.forEach(b => {
                         if (b.indices.length > 0) {
                             let isHighOutlier = b.name.includes('High Outliers');
@@ -696,7 +760,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                                 hoverinfo: 'text+x+y+z',
                                 customdata: b.indices.map(i => plotData[i])
                             };
-                            if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = b.indices.map(i => plotData[i][cz]); } 
+                            if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = b.indices.map(i => plotData[i][cz]); }
                             else { trace.type = 'scatter'; }
                             traces.push(trace);
                         }
@@ -742,7 +806,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: validIndices.map(i => plotData[i])
                     };
-                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = validIndices.map(i => plotData[i][cz]); } 
+                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = validIndices.map(i => plotData[i][cz]); }
                     else { trace.type = 'scatter'; }
                     traces.push(trace);
                 }
@@ -763,12 +827,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: nanIndices.map(i => plotData[i])
                     };
-                    if (cz !== 'none') { nanTrace.type = 'scatter3d'; nanTrace.z = nanIndices.map(i => plotData[i][cz]); } 
+                    if (cz !== 'none') { nanTrace.type = 'scatter3d'; nanTrace.z = nanIndices.map(i => plotData[i][cz]); }
                     else { nanTrace.type = 'scatter'; }
                     traces.push(nanTrace);
                 }
             }
-            
+
             let liveBg = 'rgba(0,0,0,0)';
             if (customSettings.bgMode === 'white') liveBg = '#ffffff';
             else if (customSettings.bgMode === 'cream') liveBg = '#f4f1ea';
@@ -799,20 +863,27 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 showlegend: customSettings.legendPos !== 'none',
                 legend: (customSettings.legendPos !== 'none') ? legendConfig : undefined,
                 xaxis: {
-                    title: { text: cx, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    title: { text: formatAxisLabel(cx), font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
                     tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
                     showgrid: customSettings.showGrid,
                     gridcolor: customSettings.gridColor,
                     zeroline: customSettings.showZeroLine
                 },
                 yaxis: {
-                    title: { text: cy, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    title: { text: formatAxisLabel(cy), font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
                     tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
                     showgrid: customSettings.showGrid,
                     gridcolor: customSettings.gridColor,
                     zeroline: customSettings.showZeroLine
                 }
             };
+            if (cz !== 'none') {
+                layout.scene = {
+                    xaxis: { title: formatAxisLabel(cx), showgrid: customSettings.showGrid, gridcolor: customSettings.gridColor },
+                    yaxis: { title: formatAxisLabel(cy), showgrid: customSettings.showGrid, gridcolor: customSettings.gridColor },
+                    zaxis: { title: formatAxisLabel(cz), showgrid: customSettings.showGrid, gridcolor: customSettings.gridColor }
+                };
+            }
 
             const plotConfig = {
                 responsive: true,
@@ -826,9 +897,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 }],
                 modeBarButtonsToRemove: ['toImage']
             };
-            
+
             Plotly.react('main-plot', traces, layout, plotConfig);
-            
+
             const mainPlotEl = document.getElementById('main-plot');
             if (!mainPlotEl._hasClickBound) {
                 mainPlotEl._hasClickBound = true;
@@ -838,18 +909,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     const cluster = custom[cColor];
                     const ds_tag = custom['Dataset'] ? ` (${custom['Dataset']})` : '';
                     const energy = (custom['OpenMM_Energy_kcal_mol'] !== undefined && custom['OpenMM_Energy_kcal_mol'] !== null && !isNaN(custom['OpenMM_Energy_kcal_mol'])) ? custom['OpenMM_Energy_kcal_mol'] : 'N/A (Steric Clash / Uncalculated)';
-                    
+
                     document.getElementById('modal-frame').innerText = frame;
                     document.getElementById('modal-cluster').innerText = (cluster !== undefined && cluster !== null) ? (cluster + ds_tag) : ('N/A' + ds_tag);
                     document.getElementById('modal-energy').innerText = energy;
-                    
+
                     const code = `# Load unified trajectory in PyMOL:\nload merged_reference.pdb\nload_traj merged_trajectory.xtc, merged_reference\ncmd.frame(${frame + 1})\nsave frame_${frame}_extracted.pdb, merged_reference, state=${frame + 1}\nprint("Viewing Frame ${frame} (State ${frame + 1})")`;
                     document.getElementById('pymol-code').innerText = code;
                     document.getElementById('overlay').style.display = 'block';
                     document.getElementById('pymol-modal').style.display = 'block';
                 });
             }
-            
+
             if(cols.includes('OpenMM_Energy_kcal_mol')) {
                 const e_vals = plotData.map(d => Number(d['OpenMM_Energy_kcal_mol'])).filter(v => v !== null && v !== undefined && !isNaN(v));
                 if (e_vals.length > 0) {
@@ -876,7 +947,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('exp-tick-size').value = customSettings.tickSize;
             document.getElementById('lbl-tick-size').innerText = customSettings.tickSize + ' px';
             document.getElementById('exp-font-color').value = customSettings.fontColor;
-            
+
             document.getElementById('exp-marker-size').value = customSettings.markerSize;
             document.getElementById('lbl-marker-size').innerText = customSettings.markerSize + ' px';
             document.getElementById('exp-marker-opacity').value = customSettings.markerOpacity;
@@ -885,19 +956,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('lbl-border-width').innerText = customSettings.borderWidth + ' px';
             document.getElementById('exp-border-color').value = customSettings.borderColor;
             document.getElementById('exp-legend-pos').value = customSettings.legendPos;
-            
+
             document.getElementById('exp-bg-mode').value = customSettings.bgMode;
             toggleCustomBgInput(customSettings.bgMode);
             document.getElementById('exp-custom-bg').value = customSettings.customBg;
             document.getElementById('exp-show-grid').checked = customSettings.showGrid;
             document.getElementById('exp-grid-color').value = customSettings.gridColor;
             document.getElementById('exp-show-zeroline').checked = customSettings.showZeroLine;
-            
+
             document.getElementById('exp-width').value = customSettings.width;
             document.getElementById('exp-height').value = customSettings.height;
             document.getElementById('exp-scale').value = customSettings.scale;
             document.getElementById('exp-format').value = customSettings.format;
-            
+
             document.getElementById('overlay').style.display = 'block';
             document.getElementById('export-modal').style.display = 'block';
         }
@@ -928,19 +999,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             customSettings.axisLabelSize = parseInt(document.getElementById('exp-axis-size').value) || 14;
             customSettings.tickSize = parseInt(document.getElementById('exp-tick-size').value) || 11;
             customSettings.fontColor = document.getElementById('exp-font-color').value;
-            
+
             customSettings.markerSize = parseFloat(document.getElementById('exp-marker-size').value) || 5;
             customSettings.markerOpacity = parseFloat(document.getElementById('exp-marker-opacity').value) || 0.85;
             customSettings.borderWidth = parseFloat(document.getElementById('exp-border-width').value) || 0;
             customSettings.borderColor = document.getElementById('exp-border-color').value;
             customSettings.legendPos = document.getElementById('exp-legend-pos').value;
-            
+
             customSettings.bgMode = document.getElementById('exp-bg-mode').value;
             customSettings.customBg = document.getElementById('exp-custom-bg').value;
             customSettings.showGrid = document.getElementById('exp-show-grid').checked;
             customSettings.gridColor = document.getElementById('exp-grid-color').value;
             customSettings.showZeroLine = document.getElementById('exp-show-zeroline').checked;
-            
+
             customSettings.width = parseInt(document.getElementById('exp-width').value) || 1920;
             customSettings.height = parseInt(document.getElementById('exp-height').value) || 1080;
             customSettings.scale = parseFloat(document.getElementById('exp-scale').value) || 2;
@@ -955,7 +1026,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         function downloadCustomImage() {
             updateSettingsFromModal();
-            
+
             let exportBg = '#ffffff';
             if (customSettings.bgMode === 'transparent') exportBg = 'rgba(0,0,0,0)';
             else if (customSettings.bgMode === 'cream') exportBg = '#f4f1ea';
@@ -1014,20 +1085,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
-
 def generate_dashboard(out_dir: str, df: Optional[pd.DataFrame] = None) -> str:
     """Generate metflow_dashboard.html with embedded JSON metrics."""
     os.makedirs(out_dir, exist_ok=True)
     html = DASHBOARD_HTML_TEMPLATE
     if df is not None:
-        df_json = df.to_json(orient="records")
+        df_json = df.to_json(orient="records").replace("</", "<\\/")
         html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
     else:
         csv_file = os.path.join(out_dir, "global_cluster_metrics.csv")
         if os.path.exists(csv_file):
             try:
                 df_dash = pd.read_csv(csv_file)
-                df_json = df_dash.to_json(orient="records")
+                df_json = df_dash.to_json(orient="records").replace("</", "<\\/")
                 html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
             except Exception:
                 pass

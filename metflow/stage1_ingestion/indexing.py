@@ -1,6 +1,6 @@
 """Residue/atom constants, canonical ordering, and coordinate indexing helpers."""
 
-from typing import Any
+from typing import Any, Optional, Tuple, Union
 import numpy as np
 
 PROTEIN_RESNAMES = {
@@ -42,7 +42,7 @@ def res_to_1letter(resname: str) -> str:
     return AA_3TO1.get(normalize_resname(resname), "X")
 
 
-def canonical_atom_sort_key(atom_name: str):
+def canonical_atom_sort_key(atom_name: str) -> Tuple[int, str]:
     """Sort key placing backbone atoms (N, CA, C, O, CB...) in canonical PDB order."""
     clean = atom_name.strip().upper()
     return (ATOM_ORDER_INDEX.get(clean, 999), clean)
@@ -61,15 +61,26 @@ def is_heavy_atom(atom: Any) -> bool:
     return aname in ATOM_ORDER_INDEX
 
 
+def heavy_atom_exclusion_expr(u_obj: Any) -> str:
+    """Build an MDAnalysis hydrogen-exclusion expression safe for topologies lacking 'elements' or 'types'."""
+    parts = ["name H*", "name [0-9]H*"]
+    topo = getattr(getattr(u_obj, "universe", u_obj), "_topology", None)
+    if topo is not None:
+        if hasattr(topo, "types"):
+            parts.append("type H")
+        if hasattr(topo, "elements"):
+            parts.append("element H")
+    else:
+        parts.append("type H")
+    return "not (" + " or ".join(parts) + ")"
+
+
 def extract_ca_atoms(u_obj: Any) -> Any:
     """Extract one C-alpha (or fallback) atom per protein residue."""
-    import MDAnalysis as mda
-
     if hasattr(u_obj, "select_atoms"):
         res_q = " ".join(PROTEIN_RESNAMES)
-        protein_atoms = u_obj.select_atoms(
-            f"resname {res_q} and not (name H* or name [0-9]H* or type H or element H)"
-        )
+        excl = heavy_atom_exclusion_expr(u_obj)
+        protein_atoms = u_obj.select_atoms(f"resname {res_q} and {excl}")
         target_residues = (
             protein_atoms.residues
             if len(protein_atoms) > 0
@@ -93,7 +104,7 @@ def extract_ca_atoms(u_obj: Any) -> Any:
     return u_obj.atoms if hasattr(u_obj, "atoms") else u_obj
 
 
-def precompute_atom_indexer(atom_group: Any):
+def precompute_atom_indexer(atom_group: Any) -> Union[slice, np.ndarray]:
     """Pre-compute direct numpy slice or fancy indexing array from an AtomGroup."""
     if hasattr(atom_group, "indices"):
         indices = atom_group.indices
@@ -109,7 +120,7 @@ def precompute_atom_indexer(atom_group: Any):
     return indices
 
 
-def extract_group_coords(u_ds: Any, atom_group: Any, out: np.ndarray = None) -> np.ndarray:
+def extract_group_coords(u_ds: Any, atom_group: Any, out: Optional[np.ndarray] = None) -> np.ndarray:
     """Extract (n_frames, n_atoms, 3) float32 coordinate array for an atom group."""
     n_frames = len(u_ds.trajectory)
     if isinstance(atom_group, slice):

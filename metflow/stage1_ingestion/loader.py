@@ -1,6 +1,5 @@
 """Stage 1 loader: dataset resolution, universe initialization, and consensus PDB export."""
 
-import datetime
 import os
 import shutil
 from typing import List, Tuple
@@ -9,6 +8,7 @@ import numpy as np
 
 from metflow.cli import parse_list_arg, parse_res_string, save_params
 from metflow.models import PipelineConfig, StageResult, TrajectoryContext
+from metflow.stage6_visualization.reports import init_methodology, log_methodology
 from metflow.stage1_ingestion.alignment import (
     build_consensus_atom_groups,
     find_consensus_bounds,
@@ -17,6 +17,7 @@ from metflow.stage1_ingestion.alignment import (
 from metflow.stage1_ingestion.indexing import (
     PROTEIN_RESNAMES,
     extract_ca_atoms,
+    heavy_atom_exclusion_expr,
     normalize_resname,
     precompute_atom_indexer,
     res_to_1letter,
@@ -127,9 +128,15 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
     os.makedirs(out_dir, exist_ok=True)
     param_path = save_params(config, out_dir, base_dir=config.base_dir)
 
-    ctx.methodology = [f"=== MET Pipeline Methodology ===\nDate: {datetime.datetime.now()}"]
+    if config.is_only_energy:
+        mode_label = "Energy Only (OpenMM)"
+    elif config.multi_datasets.lower() == "true" or len(dataset_configs) > 1:
+        mode_label = "Multi-Dataset Comparative Analysis"
+    else:
+        mode_label = "Single-Dataset Analysis"
+    init_methodology(ctx, mode_label)
     if config.gen_params:
-        ctx.methodology.append(f"Generation Parameters:\n{config.gen_params}")
+        log_methodology(ctx, f"Generation Parameters:\n{config.gen_params}")
 
     temp_universes = []
     prot_res_str = " ".join(PROTEIN_RESNAMES)
@@ -139,9 +146,8 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
         if not os.path.exists(xtc_p):
             raise FileNotFoundError(f"XTC file not found: {xtc_p}")
         u_temp = mda.Universe(pdb_p, xtc_p)
-        protein_atoms = u_temp.select_atoms(
-            f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
-        )
+        excl = heavy_atom_exclusion_expr(u_temp)
+        protein_atoms = u_temp.select_atoms(f"resname {prot_res_str} and {excl}")
         if len(protein_atoms) == 0:
             raise ValueError(f"No protein residues matching PROTEIN_RESNAMES found in {pdb_p}.")
         ca_group = extract_ca_atoms(protein_atoms)
@@ -163,7 +169,7 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
     )
     ctx.dataset_matches = dataset_matches
     print(seq_summary_text)
-    ctx.methodology.append(seq_summary_text)
+    log_methodology(ctx, seq_summary_text)
 
     ds_residues_homologous, ds_consensus_groups = build_consensus_atom_groups(
         temp_universes, dataset_matches, consensus_ref_start, consensus_len
@@ -213,12 +219,13 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
         if not rel_indices:
             rel_indices = list(range(min(len(pca_res_list), len(ca_indices))))
         pca_atom_indices = ca_indices[rel_indices]
-        ctx.methodology.append(
-            f"Alignment and Global PCA restricted to {len(rel_indices)} C-alpha residues from: {config.pca_res}"
+        log_methodology(
+            ctx,
+            f"Alignment and Global PCA restricted to {len(rel_indices)} C-alpha residues from: {config.pca_res}",
         )
     else:
         pca_atom_indices = ca_indices
-        ctx.methodology.append(f"Alignment and Global PCA used {len(ca_indices)} common C-alpha backbone atoms.")
+        log_methodology(ctx, f"Alignment and Global PCA used {len(ca_indices)} common C-alpha backbone atoms.")
 
     ctx.pca_atom_indices = pca_atom_indices
     ctx.ref_bb_atoms = u_consensus.atoms[pca_atom_indices]
@@ -278,7 +285,11 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
     ctx.n_frames_initial = total_frames
     ctx.valid_frames = np.arange(total_frames)
     print(f"Loaded {total_frames} total conformations across {len(dataset_configs)} dataset(s).")
-    ctx.methodology.append(f"Loaded {len(dataset_configs)} dataset(s). Total conformations: {total_frames}")
+    log_methodology(
+        ctx,
+        f"Loaded {len(dataset_configs)} dataset(s) ({', '.join(labels)}). Total conformations: {total_frames}. "
+        f"Consensus length: {consensus_len} residues ({len(u_consensus.atoms)} heavy atoms).",
+    )
 
     return StageResult(
         stage_name="stage1_ingestion",

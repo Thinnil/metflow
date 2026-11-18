@@ -19,7 +19,7 @@ from metflow.stage3_reduction.allostery import run_stage3
 from metflow.stage4_clustering.cnn import run_stage4
 from metflow.stage5_energy.openmm_engine import run_stage5
 from metflow.stage6_visualization.dashboard import generate_dashboard
-from metflow.stage6_visualization.reports import run_stage6
+from metflow.stage6_visualization.reports import init_methodology, log_methodology, run_stage6
 
 logger = logging.getLogger("metflow.orchestrator")
 
@@ -39,6 +39,9 @@ def _run_only_dashboard(argv: Optional[List[str]] = None, base_dir: str = ".") -
         return 1
 
     dash_file = generate_dashboard(out_dir_abs, df=None)
+    ctx_dash = TrajectoryContext(config=PipelineConfig(out_dir=out_dir_abs, only_dashboard="true"), out_dir=out_dir_abs)
+    init_methodology(ctx_dash, "Dashboard Only")
+    log_methodology(ctx_dash, f"Regenerated interactive dashboard: {dash_file}")
     print(f"\n✅ Dashboard generated instantly at {dash_file}")
     return 0
 
@@ -88,21 +91,29 @@ def run_stages(
             except KeyboardInterrupt:
                 logger.warning("Pipeline interrupted by user during %s.", stage_label)
                 print(f"\n⚠️ Pipeline interrupted by user during {stage_label}. Exiting cleanly.")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"Pipeline interrupted by user (KeyboardInterrupt) during {stage_label}.")
                 return 130
             except Exception as exc:
                 logger.exception("Pipeline failed in %s: %s", stage_label, exc)
                 print(f"\n❌ Error in {stage_label}: {exc}")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"Pipeline error during {stage_label}: {exc}")
                 return 1
 
             if not isinstance(result, StageResult):
                 logger.error("%s did not return a StageResult instance.", stage_label)
                 print(f"\n❌ Internal Error in {stage_label}: invalid stage result.")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"Internal error in {stage_label}: invalid stage result.")
                 return 1
 
             if not result.success or result.exit_code != 0:
                 err_msg = result.error or f"exit_code={result.exit_code}"
                 logger.error("%s failed: %s", stage_label, err_msg)
                 print(f"\n❌ {stage_label} failed: {err_msg}")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"{stage_label} failed: {err_msg}")
                 return result.exit_code if result.exit_code != 0 else 1
 
             if ctx.energy_interrupted:

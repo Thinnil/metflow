@@ -11,12 +11,59 @@ import seaborn as sns
 from sklearn.manifold import TSNE
 
 
-def _get_dataset_palette(n_ds: int):
+OKABE_ITO_PALETTE = [
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+    "#E69F00", "#56B4E9", "#F0E442", "#000000",
+]
+
+
+def _get_dataset_palette(n_ds: int) -> List[Any]:
+    if n_ds <= len(OKABE_ITO_PALETTE):
+        return OKABE_ITO_PALETTE[:max(1, n_ds)]
     if n_ds <= 10:
-        return sns.color_palette("tab10", max(1, n_ds))
+        return sns.color_palette("tab10", n_ds)
     if n_ds <= 20:
         return sns.color_palette("tab20", n_ds)
     return sns.color_palette("husl", n_ds)
+
+
+def _plot_discrete_clusters(
+    x_vals: Any,
+    y_vals: Any,
+    cluster_vals: Any,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    out_path: str,
+) -> None:
+    """Plot discrete cluster scatter with colorblind-safe palette and explicit legend."""
+    unique_cids = sorted(set(cluster_vals), key=lambda c: (c == -1, c))
+    non_noise = [c for c in unique_cids if c != -1]
+    palette = _get_dataset_palette(len(non_noise))
+    color_map = {cid: palette[i % len(palette)] for i, cid in enumerate(non_noise)}
+    color_map[-1] = "#7F7F7F"
+
+    plt.figure(figsize=(10, 8))
+    x_arr = np.asarray(x_vals)
+    y_arr = np.asarray(y_vals)
+    c_arr = np.asarray(cluster_vals)
+    for cid in unique_cids:
+        mask = c_arr == cid
+        lbl = f"Noise / Unclustered (-1) (n={int(np.sum(mask))})" if cid == -1 else f"Cluster {cid} (n={int(np.sum(mask))})"
+        plt.scatter(
+            x_arr[mask],
+            y_arr[mask],
+            color=color_map[cid],
+            label=lbl,
+            alpha=0.45 if cid == -1 else 0.7,
+            s=8 if cid == -1 else 14,
+        )
+    plt.legend(title=title, bbox_to_anchor=(1.05, 1), loc="upper left", markerscale=1.5)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 
 def generate_comparison_plots(
@@ -71,8 +118,8 @@ def generate_comparison_plots(
                 vmin=vmin,
                 vmax=vmax,
             )
-            plt.colorbar(scatter, label="Energy (kcal/mol)")
-            plt.title("Free Energy Landscape (PCA colored by OpenMM Energy)")
+            plt.colorbar(scatter, label="Potential Energy (kcal/mol)", extend="max")
+            plt.title("Free Energy Landscape (PCA colored by OpenMM Energy, kcal/mol)")
             plt.xlabel(pc1_col_name)
             plt.ylabel(pc2_col_name)
             en_plot_path = os.path.join(out_dir, "energy_landscape_plot.png")
@@ -140,15 +187,16 @@ def generate_cluster_plots(
         ("CNN_Cluster", "CNN/DBSCAN Clusters", "cnn_plot.png"),
     ]:
         if cluster_col in df.columns:
-            plt.figure(figsize=(10, 8))
-            scatter = plt.scatter(df[pc1_col], df[pc2_col], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
-            plt.colorbar(scatter, label=title)
-            plt.title(f"PCA Projection ({title})")
-            plt.xlabel(f"Principal Component 1 ({var_explained[0]:.1f}%)")
-            plt.ylabel(f"Principal Component 2 ({var_explained[1]:.1f}%)")
             out_path = os.path.join(out_dir, out_name)
-            plt.savefig(out_path, dpi=300, bbox_inches="tight")
-            plt.close()
+            _plot_discrete_clusters(
+                df[pc1_col],
+                df[pc2_col],
+                df[cluster_col],
+                title=f"PCA Projection ({title})",
+                xlabel=f"Principal Component 1 ({var_explained[0]:.1f}%)",
+                ylabel=f"Principal Component 2 ({var_explained[1]:.1f}%)",
+                out_path=out_path,
+            )
             print(f"Saved 2D Cluster Graph to {out_path}")
             artifacts.append(out_path)
     return artifacts
@@ -203,15 +251,16 @@ def generate_advanced_plots(
             ("CNN_Cluster", "CNN/DBSCAN Clusters", "tsne_cnn_plot.png"),
         ]:
             if cluster_col in df.columns:
-                plt.figure(figsize=(10, 8))
-                scatter = plt.scatter(df["tSNE_1"], df["tSNE_2"], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
-                plt.colorbar(scatter, label=title)
-                plt.title(f"t-SNE Projection ({title})")
-                plt.xlabel("t-SNE Dimension 1")
-                plt.ylabel("t-SNE Dimension 2")
                 out_path = os.path.join(out_dir, out_name)
-                plt.savefig(out_path, dpi=300, bbox_inches="tight")
-                plt.close()
+                _plot_discrete_clusters(
+                    df["tSNE_1"],
+                    df["tSNE_2"],
+                    df[cluster_col],
+                    title=f"t-SNE Projection ({title})",
+                    xlabel="t-SNE Dimension 1",
+                    ylabel="t-SNE Dimension 2",
+                    out_path=out_path,
+                )
                 print(f"Saved t-SNE Graph to {out_path}")
                 artifacts.append(out_path)
                 methodology.append(f"Generated t-SNE non-linear projection for {title}.")
@@ -284,10 +333,10 @@ def generate_pca_loadings(
 
     plot_path = os.path.join(out_dir, "pca_loadings_plot.png")
     plt.figure(figsize=(12, 5))
-    plt.plot(all_resids, pc1_full, label="PC1 Contribution", alpha=0.8, color="blue", marker=".", markersize=4)
-    plt.plot(all_resids, pc2_full, label="PC2 Contribution", alpha=0.8, color="orange", marker=".", markersize=4)
+    plt.plot(all_resids, pc1_full, label="PC1 Contribution", alpha=0.85, color="#0072B2", marker=".", markersize=4)
+    plt.plot(all_resids, pc2_full, label="PC2 Contribution", alpha=0.85, color="#D55E00", marker=".", markersize=4)
     plt.xlabel("Residue Number")
-    plt.ylabel("Loading Magnitude (RMS)")
+    plt.ylabel("Loading Magnitude (RMS, Å)")
     plt.title("Per-Residue Contribution to Principal Components")
     plt.legend()
     plt.grid(True, alpha=0.3)

@@ -30,11 +30,11 @@ def parse_list_arg(arg_str: str) -> List[str]:
 
 def validate_out_dir(out_dir: str, base_dir: str = ".") -> str:
     """Resolve out_dir against base_dir and block directory traversal outside base_dir."""
-    base_dir_abs = os.path.abspath(base_dir)
+    base_dir_abs = os.path.realpath(base_dir)
     if os.path.isabs(out_dir):
-        out_dir_abs = os.path.abspath(out_dir)
+        out_dir_abs = os.path.realpath(out_dir)
     else:
-        out_dir_abs = os.path.abspath(os.path.join(base_dir_abs, out_dir))
+        out_dir_abs = os.path.realpath(os.path.join(base_dir_abs, out_dir))
     try:
         if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
             raise ValueError(f"Directory traversal blocked: {out_dir}")

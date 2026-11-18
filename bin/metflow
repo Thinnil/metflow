@@ -33,9 +33,24 @@ validate_out_dir() {
     if [ -z "$target" ]; then
         return 0
     fi
-    if [[ "$target" =~ (^|/)\.\.(/|$) ]] || [[ "$target" = /* ]]; then
+    if [[ "$target" =~ (^|/)\.\.(/|$) ]]; then
         echo "❌ Error: Directory traversal blocked: $target" >&2
         exit 1
+    fi
+    local cwd
+    cwd=$(pwd -P 2>/dev/null || pwd)
+    local norm_target
+    norm_target=$(realpath -m "$target" 2>/dev/null || echo "")
+    if [ -n "$norm_target" ]; then
+        if [[ "$norm_target" != "$cwd" ]] && [[ "$norm_target" != "$cwd/"* ]]; then
+            echo "❌ Error: Directory traversal blocked: $target" >&2
+            exit 1
+        fi
+    elif [[ "$target" = /* ]]; then
+        if [[ "$target" != "$cwd" ]] && [[ "$target" != "$cwd/"* ]]; then
+            echo "❌ Error: Directory traversal blocked: $target" >&2
+            exit 1
+        fi
     fi
 }
 
@@ -111,6 +126,7 @@ only_dashboard=true"
                 min_steps) [ -n "$val" ] && CMD_ARGS+=(--min_steps "$val") ;;
                 allostery) [ "$val" == "true" ] && CMD_ARGS+=(--allostery "true" --advanced_plots "true") ;;
                 pca_ref) [ -n "$val" ] && CMD_ARGS+=(--pca_ref "$val") ;;
+                pca_res) [ -n "$val" ] && CMD_ARGS+=(--pca_res "$val") ;;
                 pdb) [ -n "$val" ] && CMD_ARGS+=(--pdb "$val") ;;
                 xtc) [ -n "$val" ] && CMD_ARGS+=(--xtc "$val") ;;
                 labels|dataset_labels) [ -n "$val" ] && CMD_ARGS+=(--dataset_labels "$val") ;;
@@ -169,6 +185,7 @@ calc_energy=${CALC_ENERGY_VAL}
 min_steps=${MIN_STEPS}
 allostery=${ALLOSTERY_VAL}
 pca_ref=${PCA_REF_VAL}
+pca_res=${PCA_RES_VAL}
 pdb=${CUSTOM_PDB:-}
 xtc=${CUSTOM_XTC:-}
 labels=${CUSTOM_LABELS:-}
@@ -214,6 +231,9 @@ only_dashboard=${ONLY_DASHBOARD_VAL}"
         echo "  [2] Reference PCA Space (Fit on Dataset 1 'bioemu', project all into it)"
         read -r -p "Selection [1-2] (Default: 1): " pca_ref_choice
 
+        echo ""
+        read -r -p "Restrict Alignment & PCA to specific residues/ranges? (e.g. 10-45, 60 or leave blank for ALL): " pca_res_input
+
         case $cluster_choice in
             2) CLUSTER_OPT="daura" ;;
             3) CLUSTER_OPT="cnn" ;;
@@ -239,6 +259,10 @@ only_dashboard=${ONLY_DASHBOARD_VAL}"
         if [[ "$pca_ref_choice" == "2" ]]; then
             PCA_REF_VAL="first"
             CMD_ARGS+=(--pca_ref "first")
+        fi
+        PCA_RES_VAL="${pca_res_input:-}"
+        if [ -n "$PCA_RES_VAL" ]; then
+            CMD_ARGS+=(--pca_res "$PCA_RES_VAL")
         fi
 
         if [ -n "$CUSTOM_PDB" ]; then
@@ -271,6 +295,7 @@ calc_energy=${CALC_ENERGY_VAL}
 min_steps=${MIN_STEPS}
 allostery=${ALLOSTERY_VAL}
 pca_ref=${PCA_REF_VAL}
+pca_res=${PCA_RES_VAL}
 pdb=${CUSTOM_PDB:-}
 xtc=${CUSTOM_XTC:-}
 labels=${CUSTOM_LABELS:-}
@@ -528,11 +553,14 @@ while true; do
                 CUSTOM_LABELS="${LABEL_ARRAY[*]}"
                 IFS="$old_ifs"
                 IS_MULTI_DATASET="true"
+            else
+                read -p "Output folder name [Default: energy_results]: " out_dir_in
+                CUSTOM_OUT="${out_dir_in:-energy_results}"
             fi
             run_analysis "true"
             ;;
         [Dd])
-            unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS IS_MULTI_DATASET
+            unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS CUSTOM_OUT IS_MULTI_DATASET CUSTOM_CONFIGS
             read -p "Enter results folder containing global_cluster_metrics.csv [Default: clustering_results]: " custom_dash_out
             CUSTOM_OUT="${custom_dash_out:-clustering_results}"
             run_analysis "false" "true"

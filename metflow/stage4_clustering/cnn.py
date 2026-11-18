@@ -10,6 +10,7 @@ from metflow.models import StageResult, TrajectoryContext
 from metflow.stage4_clustering.daura import run_daura
 from metflow.stage4_clustering.kmeans import run_kmeans
 from metflow.stage4_clustering.pairwise import compute_pairwise_rmsd, make_centroid_extractor
+from metflow.stage6_visualization.reports import log_methodology
 
 
 def run_cnn(rmsd_matrix: np.ndarray, eps: float, min_samples: int = 3) -> np.ndarray:
@@ -39,7 +40,7 @@ def run_stage4(ctx: TrajectoryContext) -> StageResult:
     artifacts: List[str] = []
 
     print("\n--- Starting Clustering Modules ---")
-    ctx.methodology.append("\n--- Clustering Analysis ---")
+    log_methodology(ctx, "\n--- Clustering Analysis ---")
 
     methods_to_run = ["pca_kmeans", "daura", "cnn"] if config.cluster == "all" else [config.cluster]
     allowed_methods = {"pca_kmeans", "daura", "cnn"}
@@ -68,17 +69,19 @@ def run_stage4(ctx: TrajectoryContext) -> StageResult:
                     if len(pts) > 0:
                         c_idx = int(np.where(labels == cid)[0][np.argmin(np.linalg.norm(pts - centers[cid], axis=1))])
                         artifacts.append(extract_c("pca_kmeans", c_idx, cid, method_dir))
-                ctx.methodology.append(
+                log_methodology(
+                    ctx,
                     f"PCA+KMeans (k={best_k}) used."
-                    + (" Optimal 'k' detected via Silhouette Score." if auto_det else "")
+                    + (" Optimal 'k' detected via Silhouette Score." if auto_det else ""),
                 )
             elif m == "daura":
                 labels, centroids = run_daura(ctx.rmsd_matrix, config.rmsd, config.k)
                 ctx.df_data["Daura_Cluster"] = labels
                 for cid, c_idx in enumerate(centroids):
                     artifacts.append(extract_c("daura", c_idx, cid, method_dir))
-                ctx.methodology.append(
-                    f"Daura greedy clustering (cutoff {config.rmsd} Å) extracted {len(centroids)} centroids."
+                log_methodology(
+                    ctx,
+                    f"Daura greedy clustering (RMSD cutoff {config.rmsd} Å) extracted {len(centroids)} centroids.",
                 )
             elif m == "cnn":
                 labels = run_cnn(ctx.rmsd_matrix, config.cnn_eps, min_samples=3)
@@ -90,9 +93,10 @@ def run_stage4(ctx: TrajectoryContext) -> StageResult:
                     sums = ctx.rmsd_matrix[np.ix_(idxs, idxs)].sum(axis=1)
                     center = int(idxs[np.argmin(sums)])
                     artifacts.append(extract_c("cnn", center, int(cid), method_dir))
-                ctx.methodology.append(
-                    f"CNN/DBSCAN: Density-based clustering (eps={config.cnn_eps}) extracted "
-                    f"{len(set(labels) - {-1})} clusters."
+                log_methodology(
+                    ctx,
+                    f"CNN/DBSCAN: Density-based clustering (eps={config.cnn_eps} Å, min_samples=3) extracted "
+                    f"{len(set(labels) - {-1})} clusters.",
                 )
             else:
                 raise ValueError(f"Unknown clustering method: {m}")

@@ -9,6 +9,7 @@ from scipy.spatial import ConvexHull
 from metflow.models import StageResult, TrajectoryContext
 from metflow.stage1_ingestion.indexing import extract_group_coords, precompute_atom_indexer
 from metflow.stage2_skimming.sampling import downsample_per_dataset
+from metflow.stage6_visualization.reports import log_methodology
 
 
 def _calc_vol(coords: np.ndarray) -> float:
@@ -67,7 +68,7 @@ def skim_frames(ctx: TrajectoryContext) -> Tuple[np.ndarray, Optional[str]]:
     config = ctx.config
     if not (config.is_skim and config.equator and config.top and config.bottom):
         print("Skipped skimming.")
-        ctx.methodology.append("\n--- Conformational Skimming ---\nNo skimming was applied.")
+        log_methodology(ctx, "\n--- Conformational Skimming ---\nNo skimming was applied.")
         return ctx.valid_frames, None
 
     eq_res = [int(x) for x in config.equator.replace(",", " ").split()]
@@ -119,8 +120,12 @@ def skim_frames(ctx: TrajectoryContext) -> Tuple[np.ndarray, Optional[str]]:
     passed_mask = (vols > config.min_vol) & (heights > 8.0)
     valid_frames = np.where(passed_mask)[0]
     print(f"Skimming Complete: {len(valid_frames)} / {ctx.n_frames_initial} passed.")
-    ctx.methodology.append(
-        f"Tandem skim (Volume > {config.min_vol}, Dist > 8.0). Surviving: {len(valid_frames)}"
+    log_methodology(
+        ctx,
+        f"\n--- Conformational Skimming ---\n"
+        f"Tandem skim (ConvexHull Volume > {config.min_vol} Å³, Gate Dist > 8.0 Å; "
+        f"equator={config.equator}, top={config.top}, bottom={config.bottom}). "
+        f"Surviving: {len(valid_frames)} / {ctx.n_frames_initial} frames.",
     )
 
     hull_script: Optional[str] = None
@@ -152,7 +157,7 @@ def run_stage2(ctx: TrajectoryContext) -> StageResult:
     )
     ctx.valid_frames = sampled_frames
     ctx.dataset_tags = filtered_tags
-    ctx.methodology.append(sampling_msg)
+    log_methodology(ctx, sampling_msg)
 
     return StageResult(
         stage_name="stage2_skimming",

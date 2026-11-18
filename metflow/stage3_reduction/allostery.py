@@ -1,7 +1,7 @@
 """Advanced allostery (DCCM, Cavity Sub-PCA, Loop RMSD) and Stage 3 orchestration."""
 
 import os
-from typing import List, Tuple
+from typing import Any, List, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -14,6 +14,7 @@ from metflow.models import StageResult, TrajectoryContext
 from metflow.stage1_ingestion.indexing import precompute_atom_indexer
 from metflow.stage3_reduction.kabsch import export_merged_trajectory
 from metflow.stage3_reduction.pca import compute_pca
+from metflow.stage6_visualization.reports import log_methodology
 
 
 def compute_dccm(ca_coords: np.ndarray) -> np.ndarray:
@@ -67,21 +68,30 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
     artifacts: List[str] = []
 
     print("\n--- Running Advanced Allostery Metrics ---")
-    ctx.methodology.append("\n--- Advanced Allostery Metrics ---")
+    log_methodology(ctx, "\n--- Advanced Allostery Metrics ---")
 
     print("Calculating Dynamic Cross-Correlation Matrix (DCCM)...")
     dccm = compute_dccm(ctx.coords_array)
 
     dccm_path = os.path.join(out_dir, "dccm_heatmap.png")
     plt.figure(figsize=(8, 7))
-    sns.heatmap(dccm, cmap="coolwarm", center=0, xticklabels=20, yticklabels=20)
+    sns.heatmap(
+        dccm,
+        cmap="coolwarm",
+        center=0,
+        vmin=-1,
+        vmax=1,
+        xticklabels=20,
+        yticklabels=20,
+        cbar_kws={"label": "Cross-Correlation Coefficient"},
+    )
     plt.title("Dynamic Cross-Correlation Matrix (DCCM)")
     plt.xlabel("Residue Index")
     plt.ylabel("Residue Index")
     plt.savefig(dccm_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved DCCM Heatmap to {dccm_path}")
-    ctx.methodology.append("Generated Dynamic Cross-Correlation Matrix (DCCM).")
+    log_methodology(ctx, "Generated Dynamic Cross-Correlation Matrix (DCCM).")
     artifacts.append(dccm_path)
 
     if config.cavity_res and config.loop_res:
@@ -117,7 +127,7 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
             cav_indexers.append(precompute_atom_indexer(mda.AtomGroup(c_atoms) if c_atoms else u_ds.atoms[:0]))
             loop_indexers.append(precompute_atom_indexer(mda.AtomGroup(l_atoms) if l_atoms else u_ds.atoms[:0]))
 
-        def _indexer_len(idxer) -> int:
+        def _indexer_len(idxer: Any) -> int:
             return max(0, idxer.stop - idxer.start) if isinstance(idxer, slice) else len(idxer)
 
         n_cav_atoms = _indexer_len(cav_indexers[0]) if cav_indexers else 0
@@ -172,9 +182,10 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
             plt.close()
             print(f"Saved Allostery Plot to {subpca_plot_path}")
             artifacts.append(subpca_plot_path)
-            ctx.methodology.append(
-                f"Targeted Sub-PCA applied to Cavity (res {cav_res}), colored by Loop RMSD (res {loop_res}). "
-                f"Variance: PC1={sub_var_explained[0]:.1f}%, PC2={sub_var_explained[1]:.1f}%"
+            log_methodology(
+                ctx,
+                f"Targeted Sub-PCA applied to Cavity (res {cav_res}), colored by Loop RMSD (Å) (res {loop_res}). "
+                f"Variance: PC1={sub_var_explained[0]:.1f}%, PC2={sub_var_explained[1]:.1f}%",
             )
 
             sub_n_atoms = cav_coords.shape[1]
@@ -197,11 +208,11 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
                 plt.figure(figsize=(8, 4))
                 width = 0.35
                 x = np.arange(len(sub_unique_resids))
-                plt.bar(x - width / 2, sub_res_contrib_pc1, width, label="PC1 Contribution", alpha=0.8, color="blue")
-                plt.bar(x + width / 2, sub_res_contrib_pc2, width, label="PC2 Contribution", alpha=0.8, color="orange")
+                plt.bar(x - width / 2, sub_res_contrib_pc1, width, label="PC1 Contribution", alpha=0.85, color="#0072B2")
+                plt.bar(x + width / 2, sub_res_contrib_pc2, width, label="PC2 Contribution", alpha=0.85, color="#D55E00")
                 plt.xticks(x, sub_unique_resids)
                 plt.xlabel("Cavity Residue Number")
-                plt.ylabel("Loading Magnitude (RMS)")
+                plt.ylabel("Loading Magnitude (RMS, Å)")
                 plt.title("Per-Residue Contribution to Cavity Sub-PCA")
                 plt.legend()
                 plt.grid(True, alpha=0.3, axis="y")
@@ -218,6 +229,11 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
     coords_array, rmsd_to_ref = export_merged_trajectory(ctx)
     ctx.coords_array = coords_array
     ctx.rmsd_to_ref = rmsd_to_ref
+    log_methodology(
+        ctx,
+        f"\n--- Trajectory Alignment & Dimensionality Reduction ---\n"
+        f"Exported Kabsch-aligned merged trajectory ({len(ctx.valid_frames)} frames) to {ctx.merged_xtc_path}.",
+    )
 
     X = coords_array.reshape(len(ctx.valid_frames), -1)
     ctx.X = X
@@ -229,9 +245,10 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
     ctx.pca_model = pca_model
     ctx.var_explained = var_explained
     if method_note:
-        ctx.methodology.append(method_note)
-    ctx.methodology.append(
-        f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%"
+        log_methodology(ctx, method_note)
+    log_methodology(
+        ctx,
+        f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%",
     )
 
     ctx.df_data = {

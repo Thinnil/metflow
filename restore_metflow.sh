@@ -258,7 +258,7 @@ from metflow.stage3_reduction.allostery import run_stage3
 from metflow.stage4_clustering.cnn import run_stage4
 from metflow.stage5_energy.openmm_engine import run_stage5
 from metflow.stage6_visualization.dashboard import generate_dashboard
-from metflow.stage6_visualization.reports import run_stage6
+from metflow.stage6_visualization.reports import init_methodology, log_methodology, run_stage6
 
 logger = logging.getLogger("metflow.orchestrator")
 
@@ -278,6 +278,9 @@ def _run_only_dashboard(argv: Optional[List[str]] = None, base_dir: str = ".") -
         return 1
 
     dash_file = generate_dashboard(out_dir_abs, df=None)
+    ctx_dash = TrajectoryContext(config=PipelineConfig(out_dir=out_dir_abs, only_dashboard="true"), out_dir=out_dir_abs)
+    init_methodology(ctx_dash, "Dashboard Only")
+    log_methodology(ctx_dash, f"Regenerated interactive dashboard: {dash_file}")
     print(f"\n✅ Dashboard generated instantly at {dash_file}")
     return 0
 
@@ -327,21 +330,29 @@ def run_stages(
             except KeyboardInterrupt:
                 logger.warning("Pipeline interrupted by user during %s.", stage_label)
                 print(f"\n⚠️ Pipeline interrupted by user during {stage_label}. Exiting cleanly.")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"Pipeline interrupted by user (KeyboardInterrupt) during {stage_label}.")
                 return 130
             except Exception as exc:
                 logger.exception("Pipeline failed in %s: %s", stage_label, exc)
                 print(f"\n❌ Error in {stage_label}: {exc}")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"Pipeline error during {stage_label}: {exc}")
                 return 1
 
             if not isinstance(result, StageResult):
                 logger.error("%s did not return a StageResult instance.", stage_label)
                 print(f"\n❌ Internal Error in {stage_label}: invalid stage result.")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"Internal error in {stage_label}: invalid stage result.")
                 return 1
 
             if not result.success or result.exit_code != 0:
                 err_msg = result.error or f"exit_code={result.exit_code}"
                 logger.error("%s failed: %s", stage_label, err_msg)
                 print(f"\n❌ {stage_label} failed: {err_msg}")
+                if ctx.out_dir:
+                    log_methodology(ctx, f"{stage_label} failed: {err_msg}")
                 return result.exit_code if result.exit_code != 0 else 1
 
             if ctx.energy_interrupted:
@@ -433,11 +444,11 @@ def parse_list_arg(arg_str: str) -> List[str]:
 
 def validate_out_dir(out_dir: str, base_dir: str = ".") -> str:
     """Resolve out_dir against base_dir and block directory traversal outside base_dir."""
-    base_dir_abs = os.path.abspath(base_dir)
+    base_dir_abs = os.path.realpath(base_dir)
     if os.path.isabs(out_dir):
-        out_dir_abs = os.path.abspath(out_dir)
+        out_dir_abs = os.path.realpath(out_dir)
     else:
-        out_dir_abs = os.path.abspath(os.path.join(base_dir_abs, out_dir))
+        out_dir_abs = os.path.realpath(os.path.join(base_dir_abs, out_dir))
     try:
         if os.path.commonpath([base_dir_abs, out_dir_abs]) != base_dir_abs:
             raise ValueError(f"Directory traversal blocked: {out_dir}")
@@ -904,7 +915,7 @@ EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage1_ingestion/indexing.py"
 """Residue/atom constants, canonical ordering, and coordinate indexing helpers."""
 
-from typing import Any
+from typing import Any, Optional, Tuple, Union
 import numpy as np
 
 PROTEIN_RESNAMES = {
@@ -946,7 +957,7 @@ def res_to_1letter(resname: str) -> str:
     return AA_3TO1.get(normalize_resname(resname), "X")
 
 
-def canonical_atom_sort_key(atom_name: str):
+def canonical_atom_sort_key(atom_name: str) -> Tuple[int, str]:
     """Sort key placing backbone atoms (N, CA, C, O, CB...) in canonical PDB order."""
     clean = atom_name.strip().upper()
     return (ATOM_ORDER_INDEX.get(clean, 999), clean)
@@ -965,15 +976,26 @@ def is_heavy_atom(atom: Any) -> bool:
     return aname in ATOM_ORDER_INDEX
 
 
+def heavy_atom_exclusion_expr(u_obj: Any) -> str:
+    """Build an MDAnalysis hydrogen-exclusion expression safe for topologies lacking 'elements' or 'types'."""
+    parts = ["name H*", "name [0-9]H*"]
+    topo = getattr(getattr(u_obj, "universe", u_obj), "_topology", None)
+    if topo is not None:
+        if hasattr(topo, "types"):
+            parts.append("type H")
+        if hasattr(topo, "elements"):
+            parts.append("element H")
+    else:
+        parts.append("type H")
+    return "not (" + " or ".join(parts) + ")"
+
+
 def extract_ca_atoms(u_obj: Any) -> Any:
     """Extract one C-alpha (or fallback) atom per protein residue."""
-    import MDAnalysis as mda
-
     if hasattr(u_obj, "select_atoms"):
         res_q = " ".join(PROTEIN_RESNAMES)
-        protein_atoms = u_obj.select_atoms(
-            f"resname {res_q} and not (name H* or name [0-9]H* or type H or element H)"
-        )
+        excl = heavy_atom_exclusion_expr(u_obj)
+        protein_atoms = u_obj.select_atoms(f"resname {res_q} and {excl}")
         target_residues = (
             protein_atoms.residues
             if len(protein_atoms) > 0
@@ -997,7 +1019,7 @@ def extract_ca_atoms(u_obj: Any) -> Any:
     return u_obj.atoms if hasattr(u_obj, "atoms") else u_obj
 
 
-def precompute_atom_indexer(atom_group: Any):
+def precompute_atom_indexer(atom_group: Any) -> Union[slice, np.ndarray]:
     """Pre-compute direct numpy slice or fancy indexing array from an AtomGroup."""
     if hasattr(atom_group, "indices"):
         indices = atom_group.indices
@@ -1013,7 +1035,7 @@ def precompute_atom_indexer(atom_group: Any):
     return indices
 
 
-def extract_group_coords(u_ds: Any, atom_group: Any, out: np.ndarray = None) -> np.ndarray:
+def extract_group_coords(u_ds: Any, atom_group: Any, out: Optional[np.ndarray] = None) -> np.ndarray:
     """Extract (n_frames, n_atoms, 3) float32 coordinate array for an atom group."""
     n_frames = len(u_ds.trajectory)
     if isinstance(atom_group, slice):
@@ -1037,7 +1059,6 @@ EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage1_ingestion/loader.py"
 """Stage 1 loader: dataset resolution, universe initialization, and consensus PDB export."""
 
-import datetime
 import os
 import shutil
 from typing import List, Tuple
@@ -1046,6 +1067,7 @@ import numpy as np
 
 from metflow.cli import parse_list_arg, parse_res_string, save_params
 from metflow.models import PipelineConfig, StageResult, TrajectoryContext
+from metflow.stage6_visualization.reports import init_methodology, log_methodology
 from metflow.stage1_ingestion.alignment import (
     build_consensus_atom_groups,
     find_consensus_bounds,
@@ -1054,6 +1076,7 @@ from metflow.stage1_ingestion.alignment import (
 from metflow.stage1_ingestion.indexing import (
     PROTEIN_RESNAMES,
     extract_ca_atoms,
+    heavy_atom_exclusion_expr,
     normalize_resname,
     precompute_atom_indexer,
     res_to_1letter,
@@ -1164,9 +1187,15 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
     os.makedirs(out_dir, exist_ok=True)
     param_path = save_params(config, out_dir, base_dir=config.base_dir)
 
-    ctx.methodology = [f"=== MET Pipeline Methodology ===\nDate: {datetime.datetime.now()}"]
+    if config.is_only_energy:
+        mode_label = "Energy Only (OpenMM)"
+    elif config.multi_datasets.lower() == "true" or len(dataset_configs) > 1:
+        mode_label = "Multi-Dataset Comparative Analysis"
+    else:
+        mode_label = "Single-Dataset Analysis"
+    init_methodology(ctx, mode_label)
     if config.gen_params:
-        ctx.methodology.append(f"Generation Parameters:\n{config.gen_params}")
+        log_methodology(ctx, f"Generation Parameters:\n{config.gen_params}")
 
     temp_universes = []
     prot_res_str = " ".join(PROTEIN_RESNAMES)
@@ -1176,9 +1205,8 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
         if not os.path.exists(xtc_p):
             raise FileNotFoundError(f"XTC file not found: {xtc_p}")
         u_temp = mda.Universe(pdb_p, xtc_p)
-        protein_atoms = u_temp.select_atoms(
-            f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
-        )
+        excl = heavy_atom_exclusion_expr(u_temp)
+        protein_atoms = u_temp.select_atoms(f"resname {prot_res_str} and {excl}")
         if len(protein_atoms) == 0:
             raise ValueError(f"No protein residues matching PROTEIN_RESNAMES found in {pdb_p}.")
         ca_group = extract_ca_atoms(protein_atoms)
@@ -1200,7 +1228,7 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
     )
     ctx.dataset_matches = dataset_matches
     print(seq_summary_text)
-    ctx.methodology.append(seq_summary_text)
+    log_methodology(ctx, seq_summary_text)
 
     ds_residues_homologous, ds_consensus_groups = build_consensus_atom_groups(
         temp_universes, dataset_matches, consensus_ref_start, consensus_len
@@ -1250,12 +1278,13 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
         if not rel_indices:
             rel_indices = list(range(min(len(pca_res_list), len(ca_indices))))
         pca_atom_indices = ca_indices[rel_indices]
-        ctx.methodology.append(
-            f"Alignment and Global PCA restricted to {len(rel_indices)} C-alpha residues from: {config.pca_res}"
+        log_methodology(
+            ctx,
+            f"Alignment and Global PCA restricted to {len(rel_indices)} C-alpha residues from: {config.pca_res}",
         )
     else:
         pca_atom_indices = ca_indices
-        ctx.methodology.append(f"Alignment and Global PCA used {len(ca_indices)} common C-alpha backbone atoms.")
+        log_methodology(ctx, f"Alignment and Global PCA used {len(ca_indices)} common C-alpha backbone atoms.")
 
     ctx.pca_atom_indices = pca_atom_indices
     ctx.ref_bb_atoms = u_consensus.atoms[pca_atom_indices]
@@ -1315,7 +1344,11 @@ def run_stage1(ctx: TrajectoryContext) -> StageResult:
     ctx.n_frames_initial = total_frames
     ctx.valid_frames = np.arange(total_frames)
     print(f"Loaded {total_frames} total conformations across {len(dataset_configs)} dataset(s).")
-    ctx.methodology.append(f"Loaded {len(dataset_configs)} dataset(s). Total conformations: {total_frames}")
+    log_methodology(
+        ctx,
+        f"Loaded {len(dataset_configs)} dataset(s) ({', '.join(labels)}). Total conformations: {total_frames}. "
+        f"Consensus length: {consensus_len} residues ({len(u_consensus.atoms)} heavy atoms).",
+    )
 
     return StageResult(
         stage_name="stage1_ingestion",
@@ -1393,6 +1426,7 @@ from scipy.spatial import ConvexHull
 from metflow.models import StageResult, TrajectoryContext
 from metflow.stage1_ingestion.indexing import extract_group_coords, precompute_atom_indexer
 from metflow.stage2_skimming.sampling import downsample_per_dataset
+from metflow.stage6_visualization.reports import log_methodology
 
 
 def _calc_vol(coords: np.ndarray) -> float:
@@ -1451,7 +1485,7 @@ def skim_frames(ctx: TrajectoryContext) -> Tuple[np.ndarray, Optional[str]]:
     config = ctx.config
     if not (config.is_skim and config.equator and config.top and config.bottom):
         print("Skipped skimming.")
-        ctx.methodology.append("\n--- Conformational Skimming ---\nNo skimming was applied.")
+        log_methodology(ctx, "\n--- Conformational Skimming ---\nNo skimming was applied.")
         return ctx.valid_frames, None
 
     eq_res = [int(x) for x in config.equator.replace(",", " ").split()]
@@ -1503,8 +1537,12 @@ def skim_frames(ctx: TrajectoryContext) -> Tuple[np.ndarray, Optional[str]]:
     passed_mask = (vols > config.min_vol) & (heights > 8.0)
     valid_frames = np.where(passed_mask)[0]
     print(f"Skimming Complete: {len(valid_frames)} / {ctx.n_frames_initial} passed.")
-    ctx.methodology.append(
-        f"Tandem skim (Volume > {config.min_vol}, Dist > 8.0). Surviving: {len(valid_frames)}"
+    log_methodology(
+        ctx,
+        f"\n--- Conformational Skimming ---\n"
+        f"Tandem skim (ConvexHull Volume > {config.min_vol} Å³, Gate Dist > 8.0 Å; "
+        f"equator={config.equator}, top={config.top}, bottom={config.bottom}). "
+        f"Surviving: {len(valid_frames)} / {ctx.n_frames_initial} frames.",
     )
 
     hull_script: Optional[str] = None
@@ -1536,7 +1574,7 @@ def run_stage2(ctx: TrajectoryContext) -> StageResult:
     )
     ctx.valid_frames = sampled_frames
     ctx.dataset_tags = filtered_tags
-    ctx.methodology.append(sampling_msg)
+    log_methodology(ctx, sampling_msg)
 
     return StageResult(
         stage_name="stage2_skimming",
@@ -1557,7 +1595,7 @@ cat << 'EOF' > "$INSTALL_DIR/metflow/stage3_reduction/allostery.py"
 """Advanced allostery (DCCM, Cavity Sub-PCA, Loop RMSD) and Stage 3 orchestration."""
 
 import os
-from typing import List, Tuple
+from typing import Any, List, Tuple
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -1570,6 +1608,7 @@ from metflow.models import StageResult, TrajectoryContext
 from metflow.stage1_ingestion.indexing import precompute_atom_indexer
 from metflow.stage3_reduction.kabsch import export_merged_trajectory
 from metflow.stage3_reduction.pca import compute_pca
+from metflow.stage6_visualization.reports import log_methodology
 
 
 def compute_dccm(ca_coords: np.ndarray) -> np.ndarray:
@@ -1623,21 +1662,30 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
     artifacts: List[str] = []
 
     print("\n--- Running Advanced Allostery Metrics ---")
-    ctx.methodology.append("\n--- Advanced Allostery Metrics ---")
+    log_methodology(ctx, "\n--- Advanced Allostery Metrics ---")
 
     print("Calculating Dynamic Cross-Correlation Matrix (DCCM)...")
     dccm = compute_dccm(ctx.coords_array)
 
     dccm_path = os.path.join(out_dir, "dccm_heatmap.png")
     plt.figure(figsize=(8, 7))
-    sns.heatmap(dccm, cmap="coolwarm", center=0, xticklabels=20, yticklabels=20)
+    sns.heatmap(
+        dccm,
+        cmap="coolwarm",
+        center=0,
+        vmin=-1,
+        vmax=1,
+        xticklabels=20,
+        yticklabels=20,
+        cbar_kws={"label": "Cross-Correlation Coefficient"},
+    )
     plt.title("Dynamic Cross-Correlation Matrix (DCCM)")
     plt.xlabel("Residue Index")
     plt.ylabel("Residue Index")
     plt.savefig(dccm_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved DCCM Heatmap to {dccm_path}")
-    ctx.methodology.append("Generated Dynamic Cross-Correlation Matrix (DCCM).")
+    log_methodology(ctx, "Generated Dynamic Cross-Correlation Matrix (DCCM).")
     artifacts.append(dccm_path)
 
     if config.cavity_res and config.loop_res:
@@ -1673,7 +1721,7 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
             cav_indexers.append(precompute_atom_indexer(mda.AtomGroup(c_atoms) if c_atoms else u_ds.atoms[:0]))
             loop_indexers.append(precompute_atom_indexer(mda.AtomGroup(l_atoms) if l_atoms else u_ds.atoms[:0]))
 
-        def _indexer_len(idxer) -> int:
+        def _indexer_len(idxer: Any) -> int:
             return max(0, idxer.stop - idxer.start) if isinstance(idxer, slice) else len(idxer)
 
         n_cav_atoms = _indexer_len(cav_indexers[0]) if cav_indexers else 0
@@ -1728,9 +1776,10 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
             plt.close()
             print(f"Saved Allostery Plot to {subpca_plot_path}")
             artifacts.append(subpca_plot_path)
-            ctx.methodology.append(
-                f"Targeted Sub-PCA applied to Cavity (res {cav_res}), colored by Loop RMSD (res {loop_res}). "
-                f"Variance: PC1={sub_var_explained[0]:.1f}%, PC2={sub_var_explained[1]:.1f}%"
+            log_methodology(
+                ctx,
+                f"Targeted Sub-PCA applied to Cavity (res {cav_res}), colored by Loop RMSD (Å) (res {loop_res}). "
+                f"Variance: PC1={sub_var_explained[0]:.1f}%, PC2={sub_var_explained[1]:.1f}%",
             )
 
             sub_n_atoms = cav_coords.shape[1]
@@ -1753,11 +1802,11 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
                 plt.figure(figsize=(8, 4))
                 width = 0.35
                 x = np.arange(len(sub_unique_resids))
-                plt.bar(x - width / 2, sub_res_contrib_pc1, width, label="PC1 Contribution", alpha=0.8, color="blue")
-                plt.bar(x + width / 2, sub_res_contrib_pc2, width, label="PC2 Contribution", alpha=0.8, color="orange")
+                plt.bar(x - width / 2, sub_res_contrib_pc1, width, label="PC1 Contribution", alpha=0.85, color="#0072B2")
+                plt.bar(x + width / 2, sub_res_contrib_pc2, width, label="PC2 Contribution", alpha=0.85, color="#D55E00")
                 plt.xticks(x, sub_unique_resids)
                 plt.xlabel("Cavity Residue Number")
-                plt.ylabel("Loading Magnitude (RMS)")
+                plt.ylabel("Loading Magnitude (RMS, Å)")
                 plt.title("Per-Residue Contribution to Cavity Sub-PCA")
                 plt.legend()
                 plt.grid(True, alpha=0.3, axis="y")
@@ -1774,6 +1823,11 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
     coords_array, rmsd_to_ref = export_merged_trajectory(ctx)
     ctx.coords_array = coords_array
     ctx.rmsd_to_ref = rmsd_to_ref
+    log_methodology(
+        ctx,
+        f"\n--- Trajectory Alignment & Dimensionality Reduction ---\n"
+        f"Exported Kabsch-aligned merged trajectory ({len(ctx.valid_frames)} frames) to {ctx.merged_xtc_path}.",
+    )
 
     X = coords_array.reshape(len(ctx.valid_frames), -1)
     ctx.X = X
@@ -1785,9 +1839,10 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
     ctx.pca_model = pca_model
     ctx.var_explained = var_explained
     if method_note:
-        ctx.methodology.append(method_note)
-    ctx.methodology.append(
-        f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%"
+        log_methodology(ctx, method_note)
+    log_methodology(
+        ctx,
+        f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%",
     )
 
     ctx.df_data = {
@@ -2025,6 +2080,7 @@ from metflow.models import StageResult, TrajectoryContext
 from metflow.stage4_clustering.daura import run_daura
 from metflow.stage4_clustering.kmeans import run_kmeans
 from metflow.stage4_clustering.pairwise import compute_pairwise_rmsd, make_centroid_extractor
+from metflow.stage6_visualization.reports import log_methodology
 
 
 def run_cnn(rmsd_matrix: np.ndarray, eps: float, min_samples: int = 3) -> np.ndarray:
@@ -2054,7 +2110,7 @@ def run_stage4(ctx: TrajectoryContext) -> StageResult:
     artifacts: List[str] = []
 
     print("\n--- Starting Clustering Modules ---")
-    ctx.methodology.append("\n--- Clustering Analysis ---")
+    log_methodology(ctx, "\n--- Clustering Analysis ---")
 
     methods_to_run = ["pca_kmeans", "daura", "cnn"] if config.cluster == "all" else [config.cluster]
     allowed_methods = {"pca_kmeans", "daura", "cnn"}
@@ -2083,17 +2139,19 @@ def run_stage4(ctx: TrajectoryContext) -> StageResult:
                     if len(pts) > 0:
                         c_idx = int(np.where(labels == cid)[0][np.argmin(np.linalg.norm(pts - centers[cid], axis=1))])
                         artifacts.append(extract_c("pca_kmeans", c_idx, cid, method_dir))
-                ctx.methodology.append(
+                log_methodology(
+                    ctx,
                     f"PCA+KMeans (k={best_k}) used."
-                    + (" Optimal 'k' detected via Silhouette Score." if auto_det else "")
+                    + (" Optimal 'k' detected via Silhouette Score." if auto_det else ""),
                 )
             elif m == "daura":
                 labels, centroids = run_daura(ctx.rmsd_matrix, config.rmsd, config.k)
                 ctx.df_data["Daura_Cluster"] = labels
                 for cid, c_idx in enumerate(centroids):
                     artifacts.append(extract_c("daura", c_idx, cid, method_dir))
-                ctx.methodology.append(
-                    f"Daura greedy clustering (cutoff {config.rmsd} Å) extracted {len(centroids)} centroids."
+                log_methodology(
+                    ctx,
+                    f"Daura greedy clustering (RMSD cutoff {config.rmsd} Å) extracted {len(centroids)} centroids.",
                 )
             elif m == "cnn":
                 labels = run_cnn(ctx.rmsd_matrix, config.cnn_eps, min_samples=3)
@@ -2105,9 +2163,10 @@ def run_stage4(ctx: TrajectoryContext) -> StageResult:
                     sums = ctx.rmsd_matrix[np.ix_(idxs, idxs)].sum(axis=1)
                     center = int(idxs[np.argmin(sums)])
                     artifacts.append(extract_c("cnn", center, int(cid), method_dir))
-                ctx.methodology.append(
-                    f"CNN/DBSCAN: Density-based clustering (eps={config.cnn_eps}) extracted "
-                    f"{len(set(labels) - {-1})} clusters."
+                log_methodology(
+                    ctx,
+                    f"CNN/DBSCAN: Density-based clustering (eps={config.cnn_eps} Å, min_samples=3) extracted "
+                    f"{len(set(labels) - {-1})} clusters.",
                 )
             else:
                 raise ValueError(f"Unknown clustering method: {m}")
@@ -2281,6 +2340,7 @@ EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage5_energy/csv_fusion.py"
 """Smart CSV fusion for preserving and merging OpenMM energy checkpoints."""
 
+import math
 import os
 from typing import Any, Dict
 import numpy as np
@@ -2289,12 +2349,11 @@ import pandas as pd
 
 def is_valid_energy(val: Any) -> bool:
     """Return True if val is a finite, non-NaN numeric energy value."""
-    if pd.isna(val):
+    if val is None or isinstance(val, bool):
         return False
     try:
-        f = float(val)
-        return not (np.isnan(f) or np.isinf(f))
-    except Exception:
+        return math.isfinite(float(val))
+    except (TypeError, ValueError):
         return False
 
 
@@ -2308,11 +2367,36 @@ def fuse_energy_csv(
         return 0
     try:
         df_resume = pd.read_csv(energy_csv)
+        if "Frame" not in df_resume.columns:
+            return 0
         ene_col = "Energy_kcal_mol" if "Energy_kcal_mol" in df_resume.columns else "Energy"
-        energy_dict = dict(zip(df_resume["Frame"], df_resume[ene_col]))
-        df_data["OpenMM_Energy_kcal_mol"] = [energy_dict.get(f, np.nan) for f in valid_frames]
-        print(f"✅ Auto-fused {len(energy_dict)} existing energy evaluations into clustering results!")
-        return len(energy_dict)
+        if ene_col not in df_resume.columns:
+            return 0
+
+        energy_dict: Dict[int, float] = {}
+        for raw_frame, raw_val in zip(df_resume["Frame"], df_resume[ene_col]):
+            try:
+                frame_id = int(raw_frame)
+            except (TypeError, ValueError):
+                continue
+            if is_valid_energy(raw_val):
+                energy_dict[frame_id] = float(raw_val)
+            elif frame_id not in energy_dict:
+                energy_dict[frame_id] = np.nan
+
+        fused_values = []
+        matched_valid = 0
+        for f in valid_frames:
+            val = energy_dict.get(int(f), np.nan)
+            if not math.isnan(val):
+                fused_values.append(val)
+                matched_valid += 1
+            else:
+                fused_values.append(np.nan)
+
+        df_data["OpenMM_Energy_kcal_mol"] = fused_values
+        print(f"✅ Auto-fused {matched_valid} existing energy evaluations into clustering results!")
+        return matched_valid
     except Exception as exc:
         print(f"⚠️ Could not fuse energy checkpoint: {exc}")
         return 0
@@ -2320,10 +2404,12 @@ EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage5_energy/openmm_engine.py"
 """OpenMM Amber14/OBC2 frozen-heavy-atom energy evaluation with checkpointing."""
 
+import csv
+import math
 import os
 import subprocess
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -2332,26 +2418,52 @@ import numpy as np
 import pandas as pd
 
 from metflow.models import StageResult, TrajectoryContext
-from metflow.stage1_ingestion.indexing import PROTEIN_RESNAMES, precompute_atom_indexer
+from metflow.stage1_ingestion.indexing import (
+    PROTEIN_RESNAMES,
+    heavy_atom_exclusion_expr,
+    precompute_atom_indexer,
+)
 from metflow.stage5_energy.csv_fusion import fuse_energy_csv, is_valid_energy
+from metflow.stage6_visualization.reports import log_methodology
+
+
+def _write_checkpoint_atomic(
+    energy_dict: Dict[int, float],
+    energy_csv: str,
+    return_df: bool = True,
+) -> Optional[pd.DataFrame]:
+    """Atomically write energy checkpoint CSV via a temporary file and os.replace."""
+    tmp_csv = f"{energy_csv}.tmp"
+    with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Frame", "Energy_kcal_mol"])
+        for frame_id, val in energy_dict.items():
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                writer.writerow([frame_id, ""])
+            else:
+                writer.writerow([frame_id, val])
+    os.replace(tmp_csv, energy_csv)
+    if return_df:
+        return pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"])
+    return None
 
 
 def _save_partial_plot(df_partial: pd.DataFrame, out_dir: str) -> str:
     """Generate partial_energy_progress.png on KeyboardInterrupt."""
     plt.figure(figsize=(10, 5))
     plt.subplot(1, 2, 1)
-    plt.scatter(df_partial["Frame"], df_partial["Energy_kcal_mol"], alpha=0.5, s=10, color="red")
+    plt.scatter(df_partial["Frame"], df_partial["Energy_kcal_mol"], alpha=0.6, s=12, color="#D55E00")
     plt.xlabel("Frame Index")
     plt.ylabel("Potential Energy (kcal/mol)")
-    plt.title("Partial Energy Timeline")
+    plt.title("Partial Energy Timeline (kcal/mol)")
 
     plt.subplot(1, 2, 2)
     valid_partial = df_partial["Energy_kcal_mol"].dropna()
     if len(valid_partial) > 0:
-        plt.hist(valid_partial, bins=30, color="blue", alpha=0.7)
+        plt.hist(valid_partial, bins=30, color="#0072B2", alpha=0.75)
     plt.xlabel("Potential Energy (kcal/mol)")
     plt.ylabel("Frequency (Count)")
-    plt.title("Partial Energy Distribution")
+    plt.title("Partial Energy Distribution (kcal/mol)")
 
     plt.tight_layout()
     partial_plot = os.path.join(out_dir, "partial_energy_progress.png")
@@ -2361,233 +2473,257 @@ def _save_partial_plot(df_partial: pd.DataFrame, out_dir: str) -> str:
     return partial_plot
 
 
-def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, List[str]]:
-    """Evaluate OpenMM potential energies with 50-frame checkpointing and clean interrupt handling."""
+def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, List[str], str, int]:
+    """Evaluate OpenMM potential energies with 50-frame atomic checkpointing and clean interrupt handling."""
     import MDAnalysis as mda
 
     config = ctx.config
     out_dir = ctx.out_dir
     valid_frames = ctx.valid_frames
     artifacts: List[str] = []
-
-    try:
-        import pkg_resources  # noqa: F401
-    except ImportError:
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "setuptools==69.0.0"], check=True)
-        except Exception:
-            pass
-
-    from openmm.app import ForceField, HBonds, Modeller, NoCutoff
-    import openmm as mm
-    import openmm.unit as unit
-    from pdbfixer import PDBFixer
-    from tqdm import tqdm
-
-    print("  -> Initializing OpenMM system from clean consensus reference...")
-    merged_ref_path = ctx.merged_ref_path or os.path.join(out_dir, "merged_reference.pdb")
-    if not os.path.exists(merged_ref_path):
-        merged_ref_path = ctx.master_ref_pdb
-
-    prot_res_str = " ".join(PROTEIN_RESNAMES)
-    u_ref_clean = mda.Universe(merged_ref_path)
-    u_heavy = u_ref_clean.select_atoms(
-        f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
-    )
-    if len(u_heavy) == 0:
-        u_heavy = u_ref_clean.select_atoms(
-            "not (name H* or name [0-9]H* or type H or element H or "
-            "resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
-        )
-
-    resnames = list(u_heavy.residues.resnames)
-    for i in range(len(resnames)):
-        if resnames[i] in ["HIE", "HID", "HIP", "HSD", "HSE", "HSP"]:
-            resnames[i] = "HIS"
-        elif resnames[i] in ["CYX", "CYM"]:
-            resnames[i] = "CYS"
-        elif resnames[i] in ["MSE"]:
-            resnames[i] = "MET"
-    u_heavy.residues.resnames = resnames
-
-    tmp_pdb = os.path.join(out_dir, "tmp_clean_heavy.pdb")
-    u_heavy.write(tmp_pdb)
-
-    print("  -> Initializing OpenMM with amber14/obc2 implicit solvent...")
-    print("  -> Fixing missing heavy atoms (e.g. OXT) with PDBFixer...")
-    fixer = PDBFixer(filename=tmp_pdb)
-    fixer.findMissingResidues()
-    fixer.missingResidues = {}
-    fixer.findNonstandardResidues()
-    fixer.replaceNonstandardResidues()
-    fixer.findMissingAtoms()
-    fixer.addMissingAtoms()
-
-    u_heavy_res_to_idx = {res: idx for idx, res in enumerate(u_heavy.residues)}
-    u_atom_map = {
-        (u_heavy_res_to_idx[a.residue], a.name.strip().upper()): i
-        for i, a in enumerate(u_heavy.atoms)
-    }
-
-    fixed_to_orig = []
-    parent_atom = []
-    for a in fixer.topology.atoms():
-        key = (a.residue.index, a.name.strip().upper())
-        if key in u_atom_map:
-            fixed_to_orig.append(u_atom_map[key])
-            parent_atom.append(-1)
-        else:
-            fixed_to_orig.append(-1)
-            anchor = -1
-            for other in a.residue.atoms():
-                k2 = (other.residue.index, other.name.strip().upper())
-                if k2 in u_atom_map:
-                    anchor = u_atom_map[k2]
-                    if other.name.strip().upper() in ["CA", "C", "N"]:
-                        break
-            parent_atom.append(anchor)
-
-    fixed_to_orig_arr = np.array(fixed_to_orig, dtype=int)
-    parent_atom_arr = np.array(parent_atom, dtype=int)
-
-    fixed_mask = fixed_to_orig_arr != -1
-    anchor_mask = (~fixed_mask) & (parent_atom_arr != -1)
-    fallback_mask = (~fixed_mask) & (~anchor_mask)
-
-    fixed_orig_idx = fixed_to_orig_arr[fixed_mask]
-    anchor_parent_idx = parent_atom_arr[anchor_mask]
-
-    num_fixer_atoms = fixer.topology.getNumAtoms()
-    n_anchor = int(np.sum(anchor_mask))
-    n_fallback = int(np.sum(fallback_mask))
-
-    forcefield = ForceField("amber14-all.xml", "implicit/obc2.xml")
-    print("  -> Building reference system and compiling context...")
-    ref_modeller = Modeller(fixer.topology, fixer.positions)
-    ref_modeller.addHydrogens(forcefield)
-    system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
-
-    for a in ref_modeller.topology.atoms():
-        if a.element.symbol != "H":
-            system.setParticleMass(a.index, 0.0 * unit.dalton)
-
-    integrator = mm.LangevinMiddleIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
-    try:
-        platform = mm.Platform.getPlatformByName("CUDA")
-        print("  -> 🚀 Using CUDA (GPU) for blazing fast OpenMM calculations!")
-    except Exception:
-        platform = mm.Platform.getPlatformByName("CPU")
-        print("  -> 🐢 Using CPU. (No CUDA detected). Calculations may be slow.")
-    simulation = mm.app.Simulation(ref_modeller.topology, system, integrator, platform)
-
-    ref_full_pos = np.array(ref_modeller.positions.value_in_unit(unit.nanometers), dtype=np.float32)
-    ref_pos = np.array(fixer.positions.value_in_unit(unit.nanometers), dtype=np.float32)
-    ref_pos_anchor = ref_pos[anchor_parent_idx] if n_anchor > 0 else None
-    ref_pos_anchor_offset = (ref_pos[anchor_mask] - ref_pos_anchor) if n_anchor > 0 else None
-
-    full_atoms = list(ref_modeller.topology.atoms())
-    full_atom_dict = {(a.residue.chain.index, a.residue.index, a.name.strip().upper()): i for i, a in enumerate(full_atoms)}
-    heavy_to_full = [
-        full_atom_dict.get((a.residue.chain.index, a.residue.index, a.name.strip().upper()), -1)
-        for a in fixer.topology.atoms()
-    ]
-    heavy_to_full_arr = np.array(heavy_to_full, dtype=int)
-    valid_h2f_mask = heavy_to_full_arr != -1
-    valid_h2f_src = np.where(valid_h2f_mask)[0]
-    valid_h2f_dst = heavy_to_full_arr[valid_h2f_mask]
-
-    h_parent_map = {}
-    for bond in ref_modeller.topology.bonds():
-        a1, a2 = bond[0], bond[1]
-        is_h1 = a1.element.symbol == "H"
-        is_h2 = a2.element.symbol == "H"
-        if is_h1 and not is_h2:
-            h_parent_map[a1.index] = a2.index
-        elif is_h2 and not is_h1:
-            h_parent_map[a2.index] = a1.index
-
-    h_indices = np.array(sorted(h_parent_map.keys()), dtype=int)
-    if len(h_indices) > 0:
-        h_parents = np.array([h_parent_map[i] for i in h_indices], dtype=int)
-        h_offsets = ref_full_pos[h_indices] - ref_full_pos[h_parents]
-    else:
-        h_parents = np.array([], dtype=int)
-        h_offsets = np.zeros((0, 3), dtype=np.float32)
-
-    merged_xtc_path = ctx.merged_xtc_path or os.path.join(out_dir, "merged_trajectory.xtc")
-    use_merged_traj = False
-    u_openmm = None
-    if os.path.exists(merged_ref_path) and os.path.exists(merged_xtc_path):
-        try:
-            u_openmm = mda.Universe(merged_ref_path, merged_xtc_path)
-            use_merged_traj = len(u_openmm.trajectory) == len(valid_frames)
-        except Exception:
-            use_merged_traj = False
-
-    universe_heavy_info = {}
-    if not use_merged_traj:
-        for u_obj in set(u for u, _ in ctx.frame_universe_map):
-            u_h = u_obj.select_atoms(
-                f"resname {prot_res_str} and not (name H* or name [0-9]H* or type H or element H)"
-            )
-            if len(u_h) == 0:
-                u_h = u_obj.select_atoms(
-                    "not (name H* or name [0-9]H* or type H or element H or "
-                    "resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
-                )
-            h_indexer = precompute_atom_indexer(u_h)
-            if len(u_h) == len(u_heavy):
-                map_idx = None
-            else:
-                curr_map = {(a.resid, a.name): i for i, a in enumerate(u_h)}
-                map_idx = np.zeros(len(u_heavy), dtype=int)
-                for m_idx, m_atom in enumerate(u_heavy.atoms):
-                    key = (m_atom.resid, m_atom.name)
-                    map_idx[m_idx] = curr_map.get(key, min(m_idx, len(u_h) - 1))
-            universe_heavy_info[id(u_obj)] = (h_indexer, map_idx)
-
     energy_csv = os.path.join(out_dir, "energy_checkpoint.csv")
     energy_dict: Dict[int, float] = {}
+    u_openmm = None
+    platform_name = "Unknown"
+    relax_steps = config.min_steps if config.min_steps > 0 else 25
+
     if os.path.exists(energy_csv):
         try:
             df_resume = pd.read_csv(energy_csv)
             ene_col = "Energy_kcal_mol" if "Energy_kcal_mol" in df_resume.columns else "Energy"
             raw_dict = dict(zip(df_resume["Frame"], df_resume[ene_col]))
-            energy_dict = {int(f): v for f, v in raw_dict.items() if is_valid_energy(v)}
+            energy_dict = {int(f): float(v) for f, v in raw_dict.items() if is_valid_energy(v)}
             print(f"  -> Found checkpoint! Resuming {len(energy_dict)} valid previously minimized frames...")
+            log_methodology(
+                ctx,
+                f"Resumed OpenMM energy checkpoint ({len(energy_dict)} valid frames already evaluated) from {energy_csv}.",
+            )
         except Exception:
             energy_dict = {}
 
-    relax_steps = config.min_steps if config.min_steps > 0 else 25
-    if config.min_steps > 0:
-        print(f"  -> Relaxing hydrogens and evaluating energy ({config.min_steps} steps per frame, heavy atoms frozen)...")
-    else:
-        print("  -> Evaluating potential energy with hydrogen clash-relief (25 steps per frame, heavy atoms frozen)...")
-
-    full_heavy_pos = np.zeros((num_fixer_atoms, 3), dtype=np.float32)
-    if n_fallback > 0:
-        full_heavy_pos[fallback_mask] = ref_pos[fallback_mask]
-    current_full_pos = ref_full_pos.copy()
-
     try:
-        for local_idx, frame_idx in enumerate(tqdm(valid_frames)):
+        try:
+            import pkg_resources  # noqa: F401
+        except ImportError:
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "setuptools==69.0.0"], check=True)
+            except Exception:
+                pass
+
+        from openmm.app import ForceField, HBonds, Modeller, NoCutoff
+        import openmm as mm
+        import openmm.unit as unit
+        from pdbfixer import PDBFixer
+        from tqdm import tqdm
+
+        print("  -> Initializing OpenMM system from clean consensus reference...")
+        merged_ref_path = ctx.merged_ref_path or os.path.join(out_dir, "merged_reference.pdb")
+        if not os.path.exists(merged_ref_path):
+            merged_ref_path = ctx.master_ref_pdb
+
+        prot_res_str = " ".join(PROTEIN_RESNAMES)
+        u_ref_clean = mda.Universe(merged_ref_path)
+        ref_excl = heavy_atom_exclusion_expr(u_ref_clean)
+        u_heavy = u_ref_clean.select_atoms(f"resname {prot_res_str} and {ref_excl}")
+        if len(u_heavy) == 0:
+            u_heavy = u_ref_clean.select_atoms(
+                f"{ref_excl} and not (resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
+            )
+
+        resnames = list(u_heavy.residues.resnames)
+        for i in range(len(resnames)):
+            if resnames[i] in ["HIE", "HID", "HIP", "HSD", "HSE", "HSP"]:
+                resnames[i] = "HIS"
+            elif resnames[i] in ["CYX", "CYM"]:
+                resnames[i] = "CYS"
+            elif resnames[i] in ["MSE"]:
+                resnames[i] = "MET"
+        u_heavy.residues.resnames = resnames
+
+        tmp_pdb = os.path.join(out_dir, "tmp_clean_heavy.pdb")
+        u_heavy.write(tmp_pdb)
+
+        print("  -> Initializing OpenMM with amber14/obc2 implicit solvent...")
+        print("  -> Fixing missing heavy atoms (e.g. OXT) with PDBFixer...")
+        fixer = PDBFixer(filename=tmp_pdb)
+        fixer.findMissingResidues()
+        fixer.missingResidues = {}
+        fixer.findNonstandardResidues()
+        fixer.replaceNonstandardResidues()
+        fixer.findMissingAtoms()
+        fixer.addMissingAtoms()
+
+        u_heavy_res_to_idx = {res: idx for idx, res in enumerate(u_heavy.residues)}
+        u_atom_map = {
+            (u_heavy_res_to_idx[a.residue], a.name.strip().upper()): i
+            for i, a in enumerate(u_heavy.atoms)
+        }
+
+        fixed_to_orig = []
+        parent_atom = []
+        for a in fixer.topology.atoms():
+            key = (a.residue.index, a.name.strip().upper())
+            if key in u_atom_map:
+                fixed_to_orig.append(u_atom_map[key])
+                parent_atom.append(-1)
+            else:
+                fixed_to_orig.append(-1)
+                anchor = -1
+                for other in a.residue.atoms():
+                    k2 = (other.residue.index, other.name.strip().upper())
+                    if k2 in u_atom_map:
+                        anchor = u_atom_map[k2]
+                        if other.name.strip().upper() in ["CA", "C", "N"]:
+                            break
+                parent_atom.append(anchor)
+
+        fixed_to_orig_arr = np.array(fixed_to_orig, dtype=int)
+        parent_atom_arr = np.array(parent_atom, dtype=int)
+
+        fixed_mask = fixed_to_orig_arr != -1
+        anchor_mask = (~fixed_mask) & (parent_atom_arr != -1)
+        fallback_mask = (~fixed_mask) & (~anchor_mask)
+
+        fixed_orig_idx = fixed_to_orig_arr[fixed_mask]
+        anchor_parent_idx = parent_atom_arr[anchor_mask]
+
+        num_fixer_atoms = fixer.topology.getNumAtoms()
+        n_anchor = int(np.sum(anchor_mask))
+        n_fallback = int(np.sum(fallback_mask))
+
+        forcefield = ForceField("amber14-all.xml", "implicit/obc2.xml")
+        print("  -> Building reference system and compiling context...")
+        ref_modeller = Modeller(fixer.topology, fixer.positions)
+        ref_modeller.addHydrogens(forcefield)
+        system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
+
+        for a in ref_modeller.topology.atoms():
+            if a.element.symbol != "H":
+                system.setParticleMass(a.index, 0.0 * unit.dalton)
+
+        integrator = mm.LangevinMiddleIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
+        try:
+            platform = mm.Platform.getPlatformByName("CUDA")
+            print("  -> 🚀 Using CUDA (GPU) for blazing fast OpenMM calculations!")
+        except Exception:
+            platform = mm.Platform.getPlatformByName("CPU")
+            print("  -> 🐢 Using CPU. (No CUDA detected). Calculations may be slow.")
+        platform_name = platform.getName()
+        simulation = mm.app.Simulation(ref_modeller.topology, system, integrator, platform)
+
+        ref_full_pos = np.array(ref_modeller.positions.value_in_unit(unit.nanometers), dtype=np.float32)
+        ref_pos = np.array(fixer.positions.value_in_unit(unit.nanometers), dtype=np.float32)
+        ref_pos_anchor = ref_pos[anchor_parent_idx] if n_anchor > 0 else None
+        ref_pos_anchor_offset = (ref_pos[anchor_mask] - ref_pos_anchor) if n_anchor > 0 else None
+
+        full_atoms = list(ref_modeller.topology.atoms())
+        full_atom_dict = {(a.residue.chain.index, a.residue.index, a.name.strip().upper()): i for i, a in enumerate(full_atoms)}
+        heavy_to_full = [
+            full_atom_dict.get((a.residue.chain.index, a.residue.index, a.name.strip().upper()), -1)
+            for a in fixer.topology.atoms()
+        ]
+        heavy_to_full_arr = np.array(heavy_to_full, dtype=int)
+        valid_h2f_mask = heavy_to_full_arr != -1
+        valid_h2f_src = np.where(valid_h2f_mask)[0]
+        valid_h2f_dst = heavy_to_full_arr[valid_h2f_mask]
+
+        h_parent_map = {}
+        for bond in ref_modeller.topology.bonds():
+            a1, a2 = bond[0], bond[1]
+            is_h1 = a1.element.symbol == "H"
+            is_h2 = a2.element.symbol == "H"
+            if is_h1 and not is_h2:
+                h_parent_map[a1.index] = a2.index
+            elif is_h2 and not is_h1:
+                h_parent_map[a2.index] = a1.index
+
+        h_indices = np.array(sorted(h_parent_map.keys()), dtype=int)
+        if len(h_indices) > 0:
+            h_parents = np.array([h_parent_map[i] for i in h_indices], dtype=int)
+            h_offsets = ref_full_pos[h_indices] - ref_full_pos[h_parents]
+        else:
+            h_parents = np.array([], dtype=int)
+            h_offsets = np.zeros((0, 3), dtype=np.float32)
+
+        merged_xtc_path = ctx.merged_xtc_path or os.path.join(out_dir, "merged_trajectory.xtc")
+        use_merged_traj = False
+        merged_heavy_indexer = None
+        if os.path.exists(merged_ref_path) and os.path.exists(merged_xtc_path):
+            try:
+                u_openmm = mda.Universe(merged_ref_path, merged_xtc_path)
+                use_merged_traj = len(u_openmm.trajectory) == len(valid_frames)
+            except Exception:
+                use_merged_traj = False
+
+        if use_merged_traj and u_openmm is not None:
+            openmm_excl = heavy_atom_exclusion_expr(u_openmm)
+            u_openmm_heavy = u_openmm.select_atoms(f"resname {prot_res_str} and {openmm_excl}")
+            if len(u_openmm_heavy) == 0:
+                u_openmm_heavy = u_openmm.select_atoms(
+                    f"{openmm_excl} and not (resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
+                )
+            merged_heavy_indexer = precompute_atom_indexer(u_openmm_heavy)
+            if len(u_openmm_heavy) != len(u_heavy):
+                curr_map = {(a.resid, a.name.strip().upper()): i for i, a in enumerate(u_openmm_heavy)}
+                merged_map_idx = np.zeros(len(u_heavy), dtype=int)
+                for m_idx, m_atom in enumerate(u_heavy.atoms):
+                    key = (m_atom.resid, m_atom.name.strip().upper())
+                    merged_map_idx[m_idx] = curr_map.get(key, min(m_idx, max(0, len(u_openmm_heavy) - 1)))
+                merged_heavy_indexer = merged_heavy_indexer[merged_map_idx]
+
+        universe_heavy_info = {}
+        if not use_merged_traj:
+            for u_obj in set(u for u, _ in ctx.frame_universe_map):
+                u_excl = heavy_atom_exclusion_expr(u_obj)
+                u_h = u_obj.select_atoms(f"resname {prot_res_str} and {u_excl}")
+                if len(u_h) == 0:
+                    u_h = u_obj.select_atoms(
+                        f"{u_excl} and not (resname WAT or resname HOH or resname SOL or resname NA or resname CL)"
+                    )
+                h_indexer = precompute_atom_indexer(u_h)
+                if len(u_h) != len(u_heavy):
+                    curr_map = {(a.resid, a.name.strip().upper()): i for i, a in enumerate(u_h)}
+                    map_idx = np.zeros(len(u_heavy), dtype=int)
+                    for m_idx, m_atom in enumerate(u_heavy.atoms):
+                        key = (m_atom.resid, m_atom.name.strip().upper())
+                        map_idx[m_idx] = curr_map.get(key, min(m_idx, max(0, len(u_h) - 1)))
+                    h_indexer = h_indexer[map_idx]
+                universe_heavy_info[id(u_obj)] = h_indexer
+
+        if config.min_steps > 0:
+            print(f"  -> Relaxing hydrogens and evaluating energy ({relax_steps} steps per frame, heavy atoms frozen)...")
+        else:
+            print(f"  -> Evaluating potential energy with hydrogen clash-relief ({relax_steps} steps per frame, heavy atoms frozen)...")
+
+        log_methodology(
+            ctx,
+            f"OpenMM setup: Amber14/OBC2 implicit solvent, platform={platform_name}, "
+            f"hydrogen relaxation={relax_steps} steps (heavy atoms frozen).",
+        )
+
+        full_heavy_pos = np.zeros((num_fixer_atoms, 3), dtype=np.float32)
+        if n_fallback > 0:
+            full_heavy_pos[fallback_mask] = ref_pos[fallback_mask]
+        current_full_pos = ref_full_pos.copy()
+
+        newly_evaluated = 0
+        for local_idx, frame_idx in enumerate(tqdm(valid_frames, desc="OpenMM Energy")):
             frame_key = int(frame_idx)
             if frame_key in energy_dict and is_valid_energy(energy_dict[frame_key]):
                 continue
 
             if use_merged_traj:
                 ts = u_openmm.trajectory[local_idx]
-                heavy_pos_src = ts.positions * 0.1
+                heavy_pos_src = ts.positions[merged_heavy_indexer] * np.float32(0.1)
             else:
                 u_curr, raw_local_idx = ctx.frame_universe_map[frame_key]
                 ts = u_curr.trajectory[raw_local_idx]
-                h_indexer, map_idx = universe_heavy_info[id(u_curr)]
+                h_indexer = universe_heavy_info[id(u_curr)]
                 pos_angstroms = ts.positions[h_indexer]
                 pos_centered = pos_angstroms - pos_angstroms.mean(axis=0)
                 rms_dist = np.sqrt(np.mean(np.sum(pos_centered ** 2, axis=1)))
-                scale = 0.1 if rms_dist >= 5.0 else 1.0
-                frame_orig_pos = pos_angstroms * scale
-                heavy_pos_src = frame_orig_pos if map_idx is None else frame_orig_pos[map_idx]
+                scale = np.float32(0.1) if rms_dist >= 5.0 else np.float32(1.0)
+                heavy_pos_src = pos_angstroms * scale
 
             full_heavy_pos[fixed_mask] = heavy_pos_src[fixed_orig_idx]
             if n_anchor > 0:
@@ -2612,19 +2748,22 @@ def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, L
                 energy_val = np.nan
 
             energy_dict[frame_key] = energy_val
-            if len(energy_dict) % 50 == 0:
-                pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"]).to_csv(
-                    energy_csv, index=False
-                )
+            newly_evaluated += 1
+            if newly_evaluated % 50 == 0:
+                _write_checkpoint_atomic(energy_dict, energy_csv, return_df=False)
     except KeyboardInterrupt:
-        df_partial = pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"])
-        df_partial.to_csv(energy_csv, index=False)
+        df_partial = _write_checkpoint_atomic(energy_dict, energy_csv, return_df=True)
         artifacts.append(energy_csv)
         print(f"\n⚠️  Energy calculation PAUSED by user! Saved checkpoint ({len(energy_dict)} frames) to {energy_csv}")
-        if len(df_partial) > 1:
+        log_methodology(
+            ctx,
+            f"OpenMM Energy calculation paused by user (KeyboardInterrupt). "
+            f"Saved atomic partial checkpoint ({len(energy_dict)} frames) to {energy_csv}.",
+        )
+        if df_partial is not None and len(df_partial) > 1:
             artifacts.append(_save_partial_plot(df_partial, out_dir))
         print("Run the script again to resume exactly where you left off.")
-        return energy_dict, True, artifacts
+        return energy_dict, True, artifacts, platform_name, relax_steps
     finally:
         if u_openmm is not None:
             try:
@@ -2632,9 +2771,9 @@ def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, L
             except Exception:
                 pass
 
-    pd.DataFrame(list(energy_dict.items()), columns=["Frame", "Energy_kcal_mol"]).to_csv(energy_csv, index=False)
+    _write_checkpoint_atomic(energy_dict, energy_csv, return_df=False)
     artifacts.append(energy_csv)
-    return energy_dict, False, artifacts
+    return energy_dict, False, artifacts, platform_name, relax_steps
 
 
 def run_stage5(ctx: TrajectoryContext) -> StageResult:
@@ -2643,12 +2782,13 @@ def run_stage5(ctx: TrajectoryContext) -> StageResult:
     out_dir = ctx.out_dir
     valid_frames = ctx.valid_frames
     artifacts: List[str] = []
+    energy_csv = os.path.join(out_dir, "energy_checkpoint.csv")
 
     if config.is_calc_energy:
         print("\n--- Calculating Thermodynamic Energy (OpenMM Physical Minimization) ---")
-        ctx.methodology.append("\n--- OpenMM Energy Calculation ---")
+        log_methodology(ctx, "\n--- OpenMM Energy Calculation ---")
         try:
-            energy_dict, interrupted, energy_artifacts = run_openmm_energy(ctx)
+            energy_dict, interrupted, energy_artifacts, platform_name, relax_steps = run_openmm_energy(ctx)
             artifacts.extend(energy_artifacts)
             if interrupted:
                 ctx.energy_interrupted = True
@@ -2662,17 +2802,22 @@ def run_stage5(ctx: TrajectoryContext) -> StageResult:
             energies_kcal = [energy_dict.get(int(f), np.nan) for f in valid_frames]
             ctx.df_data["OpenMM_Energy_kcal_mol"] = energies_kcal
             valid_cnt = sum(1 for e in energies_kcal if pd.notna(e))
-            ctx.methodology.append(
-                f"Evaluated Thermodynamic Potential Energy (OpenMM, Amber14/OBC2, {config.min_steps}-step "
-                f"Minimization, {valid_cnt}/{len(valid_frames)} valid)."
+            log_methodology(
+                ctx,
+                f"Evaluated Thermodynamic Potential Energy (OpenMM, Amber14/OBC2, platform={platform_name}, "
+                f"{relax_steps}-step Minimization, {valid_cnt}/{len(valid_frames)} valid, unit: kcal/mol).",
             )
             print(f"✅ OpenMM Energy Evaluation complete ({valid_cnt}/{len(valid_frames)} valid frames).")
         except Exception as exc:
             print(f"❌ Error during OpenMM Energy calculation: {exc}")
-            ctx.methodology.append(f"OpenMM Energy Calculation failed: {exc}")
+            log_methodology(ctx, f"OpenMM Energy Calculation failed: {exc}")
 
-    energy_csv = os.path.join(out_dir, "energy_checkpoint.csv")
     fused_count = fuse_energy_csv(ctx.df_data, valid_frames, energy_csv)
+    if not config.is_calc_energy and fused_count > 0:
+        log_methodology(
+            ctx,
+            f"Auto-fused {fused_count} existing OpenMM energy evaluations (kcal/mol) from {energy_csv}.",
+        )
     return StageResult(
         stage_name="stage5_energy",
         success=True,
@@ -2684,9 +2829,21 @@ EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/__init__.py"
 """Stage 6: Static plots, interactive Art Nouveau dashboard, and reports."""
 
-from metflow.stage6_visualization.reports import run_stage6
+from metflow.stage6_visualization.reports import (
+    init_methodology,
+    log_methodology,
+    run_stage6,
+    write_cluster_summary,
+    write_methodology,
+)
 
-__all__ = ["run_stage6"]
+__all__ = [
+    "init_methodology",
+    "log_methodology",
+    "run_stage6",
+    "write_cluster_summary",
+    "write_methodology",
+]
 EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/dashboard.py"
 """Art Nouveau HTML dashboard generation and --only_dashboard fast path."""
@@ -2699,6 +2856,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MET Flow - Art Nouveau Dashboard</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
@@ -2723,7 +2881,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         #pymol-code { background: #000; color: #0f0; padding: 15px; border-radius: 5px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; }
         .close-btn { background: var(--gold); color: var(--dark-green); border: none; padding: 10px 20px; cursor: pointer; font-weight: bold; margin-top: 15px; border-radius: 5px;}
         .overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.55); z-index: 999; backdrop-filter: blur(2px); }
-        
+
         /* Interactive Image Customization & Export Modal */
         #export-modal { display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #ffffff; color: var(--text-color); padding: 25px 30px; border: 3px solid var(--gold); border-radius: 16px; z-index: 1001; box-shadow: 0 15px 45px rgba(0,0,0,0.45); width: 92%; max-width: 820px; max-height: 90vh; overflow-y: auto; font-family: 'Lato', sans-serif; }
         #export-modal h2 { font-family: 'Playfair Display', serif; color: var(--dark-green); margin: 0 0 15px 0; border-bottom: 2px solid var(--gold); padding-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
@@ -2744,6 +2902,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-download:hover { filter: brightness(1.1); }
         .btn-cancel { background: #e2e8f0; color: #4a5568; border: none; padding: 9px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.92em; }
         .btn-cancel:hover { background: #cbd5e1; }
+        .modal-close-icon { background: transparent; border: 1px solid var(--gold); color: var(--dark-green); border-radius: 4px; cursor: pointer; font-size: 0.9em; padding: 4px 8px; }
+        .modal-close-icon:hover { background: var(--bg-color); }
+        #status-banner { display: none; padding: 10px 14px; border-radius: 6px; font-size: 0.9em; font-weight: 600; border: 1px solid var(--gold); background: #edf7ed; color: #1b3a30; }
+        #status-banner.warning { background: #fef3c7; color: #78350f; border-color: #d97706; }
+        .file-drop:focus, button:focus, select:focus, input:focus { outline: 2px solid var(--dark-green); outline-offset: 2px; }
+        @media (max-width: 900px) {
+            body { height: auto; }
+            .container { flex-direction: column; overflow: visible; }
+            .sidebar { width: auto; }
+        }
     </style>
 </head>
 <body>
@@ -2752,46 +2920,54 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="font-style: italic;">Thermodynamic & Conformational Analytics</div>
     </header>
     <div class="container">
-        <div class="sidebar">
+        <aside class="sidebar" aria-label="Controls and Data Ingestion">
             <h2>Data Ingestion</h2>
-            <div class="file-drop" id="drop-zone">
+            <div class="file-drop" id="drop-zone" tabindex="0" role="button" aria-label="Drop CSV files here or press Enter to browse">
                 Drop <b>global_cluster_metrics.csv</b>, <b>energy_checkpoint.csv</b>, or <b>pca_loadings.csv</b> here
-                <input type="file" id="file-input" style="display: none;" accept=".csv" multiple>
+                <input type="file" id="file-input" style="display: none;" accept=".csv" multiple aria-label="Upload CSV files">
             </div>
-            <button class="export-btn" onclick="exportCSV()">💾 Export Merged CSV</button>
-            <button class="export-btn" onclick="openExportModal()" style="margin-top: 10px; background: #1b3a30; color: #d4af37; border: 1px solid #d4af37;">🎨 Customize & Export Image</button>
+            <div id="status-banner" role="status" aria-live="polite"></div>
+            <button type="button" class="export-btn" onclick="exportCSV()">💾 Export Merged CSV</button>
+            <button type="button" class="export-btn" onclick="openExportModal()" style="margin-top: 10px; background: #1b3a30; color: #d4af37; border: 1px solid #d4af37;">🎨 Customize & Export Image</button>
             <h2>Plot Controls</h2>
-            <label>Filter Dataset: <select id="sel-filter-dataset" onchange="updatePlots()">
+            <label for="sel-filter-dataset">Filter Dataset:</label>
+            <select id="sel-filter-dataset" aria-label="Filter Dataset" onchange="updatePlots()">
                 <option value="all" selected>All Datasets (Combined)</option>
-            </select></label>
-            <label>X-Axis: <select id="sel-x"></select></label>
-            <label>Y-Axis: <select id="sel-y"></select></label>
-            <label>Z-Axis (3D): <select id="sel-z"><option value="none">None (2D Plot)</option></select></label>
-            <label>Color By: <select id="sel-color"></select></label>
+            </select>
+            <label for="sel-x">X-Axis:</label>
+            <select id="sel-x" aria-label="X-Axis"></select>
+            <label for="sel-y">Y-Axis:</label>
+            <select id="sel-y" aria-label="Y-Axis"></select>
+            <label for="sel-z">Z-Axis (3D):</label>
+            <select id="sel-z" aria-label="Z-Axis (3D)"><option value="none">None (2D Plot)</option></select>
+            <label for="sel-color">Color By:</label>
+            <select id="sel-color" aria-label="Color By"></select>
             <div id="color-mode-container" style="margin-top:8px;">
-                <label>Coloring Mode: <select id="sel-color-mode" onchange="updatePlots()">
+                <label for="sel-color-mode">Coloring Mode:</label>
+                <select id="sel-color-mode" aria-label="Coloring Mode" onchange="updatePlots()">
                     <option value="binned" selected>Interval Ranges (Box-Plot with Outliers)</option>
                     <option value="continuous">Continuous Gradient</option>
-                </select></label>
+                </select>
             </div>
             <div id="colorscale-container" style="display:none; margin-top:8px;">
-                <label>Colorscale: <select id="sel-colorscale" onchange="updatePlots()">
+                <label for="sel-colorscale">Colorscale:</label>
+                <select id="sel-colorscale" aria-label="Colorscale" onchange="updatePlots()">
                     <option value="Viridis">Viridis</option>
                     <option value="Plasma">Plasma</option>
                     <option value="Inferno">Inferno</option>
                     <option value="Jet">Jet</option>
                     <option value="RdBu">Red-Blue (RdBu)</option>
-                </select></label>
+                </select>
             </div>
             <div style="margin-top: 15px;">
-                <label style="display:flex; align-items:center; gap: 8px;">
-                    <input type="checkbox" id="filter-energy" onchange="updatePlots()"> Only show frames with Energy data
+                <label for="filter-energy" style="display:flex; align-items:center; gap: 8px;">
+                    <input type="checkbox" id="filter-energy" aria-label="Only show frames with Energy data" onchange="updatePlots()"> Only show frames with Energy data
                 </label>
             </div>
-        </div>
-        <div class="main-content">
+        </aside>
+        <main class="main-content">
             <div class="plot-container" id="main-plot" style="height: 85vh; min-height: 700px; position: relative;">
-                <div id="main-plot-placeholder" style="position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #888; pointer-events: none; z-index: 1;">
+                <div id="main-plot-placeholder" style="position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #595959; pointer-events: none; z-index: 1;">
                     <div style="font-size: 1.3em; font-family: 'Playfair Display', serif; color: #1b3a30; margin-bottom: 8px;">Awaiting Trajectory Data</div>
                     <div>Drag & drop <b>global_cluster_metrics.csv</b> or wait for sample metrics to render.</div>
                 </div>
@@ -2799,26 +2975,26 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="plot-container" id="loadings-plot" style="display: none; height: 400px;"></div>
             <div style="display: flex; gap: 20px;">
                 <div class="plot-container" id="timeseries-plot" style="flex: 1; height: 400px; overflow:hidden;">
-                    <div style="text-align:center; padding: 100px; color: #888;">No Energy Data Found.<br><br>Drag & drop <b>energy_checkpoint.csv</b> to dynamically merge and visualize energy!</div>
+                    <div style="text-align:center; padding: 100px; color: #595959;">No Energy Data Found.<br><br>Drag & drop <b>energy_checkpoint.csv</b> to dynamically merge and visualize energy (kcal/mol)!</div>
                 </div>
                 <div class="plot-container" id="hist-plot" style="flex: 1; height: 400px;"></div>
             </div>
-        </div>
+        </main>
     </div>
     <div class="overlay" id="overlay" onclick="closeModal()"></div>
-    <div id="pymol-modal">
-        <h3>Frame Selected!</h3>
-        <p>Frame ID: <span id="modal-frame"></span> | Cluster/Color: <span id="modal-cluster"></span> | Energy: <span id="modal-energy"></span></p>
+    <div id="pymol-modal" role="dialog" aria-modal="true" aria-labelledby="pymol-modal-title">
+        <h3 id="pymol-modal-title">Frame Selected!</h3>
+        <p>Frame ID: <span id="modal-frame"></span> | Cluster/Color: <span id="modal-cluster"></span> | Energy (kcal/mol): <span id="modal-energy"></span></p>
         <p>To extract this frame in PyMOL on your server, copy and paste this command:</p>
         <div id="pymol-code"></div>
-        <button class="close-btn" onclick="closeModal()">Close</button>
+        <button type="button" class="close-btn" onclick="closeModal()">Close</button>
     </div>
 
     <!-- Export & Styling Customization Modal -->
-    <div id="export-modal">
-        <h2>
+    <div id="export-modal" role="dialog" aria-modal="true" aria-labelledby="export-modal-title">
+        <h2 id="export-modal-title">
             <span>🎨 Customize Image & Export</span>
-            <span style="cursor: pointer; font-size: 0.9em;" onclick="closeModal()">✖</span>
+            <button type="button" class="modal-close-icon" aria-label="Close export modal" onclick="closeModal()">✖</button>
         </h2>
         <div class="modal-grid">
             <!-- Section 1: Typography & Labels -->
@@ -2973,19 +3149,54 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
         let cols = [];
         let pendingFiles = [];
         let mergeTimeout = null;
-        
+
+        function showStatus(message, isWarning = false) {
+            const banner = document.getElementById('status-banner');
+            if (!banner) return;
+            if (!message) {
+                banner.style.display = 'none';
+                banner.innerText = '';
+                banner.classList.remove('warning');
+                return;
+            }
+            banner.innerText = message;
+            banner.classList.toggle('warning', Boolean(isWarning));
+            banner.style.display = 'block';
+        }
+
+        function formatAxisLabel(col) {
+            if (!col) return '';
+            const lower = col.toLowerCase();
+            if (lower.includes('rmsd') && !lower.includes('å') && !lower.includes('angstrom')) {
+                return `${col} (Å)`;
+            }
+            if (lower.includes('energy') && !lower.includes('kcal')) {
+                return `${col} (kcal/mol)`;
+            }
+            return col;
+        }
+
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
-        
+
         dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                fileInput.click();
+            }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
         dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.background = '#e8e4d8'; });
         dropZone.addEventListener('dragleave', () => dropZone.style.background = '');
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault(); dropZone.style.background = '';
             Array.from(e.dataTransfer.files).forEach(f => processFile(f));
         });
-        fileInput.addEventListener('change', (e) => { 
-            Array.from(e.target.files).forEach(f => processFile(f)); 
+        fileInput.addEventListener('change', (e) => {
+            Array.from(e.target.files).forEach(f => processFile(f));
         });
 
         window.addEventListener('DOMContentLoaded', () => {
@@ -3013,7 +3224,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     }});
                 }).catch(() => {});
         });
-        
+
         function processFile(file) {
             const ph = document.getElementById('main-plot-placeholder');
             if (ph) { ph.style.display = 'none'; ph.remove(); }
@@ -3021,13 +3232,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 complete: function(results) {
                     if (results.meta.fields.includes('Residue') && results.meta.fields.includes('PC1_Contribution')) {
                         globalLoadings = results.data;
-                        alert("✅ Loaded PCA Loadings Data!");
+                        showStatus("✅ Loaded PCA Loadings Data!");
                         updatePlots();
                         return;
                     }
-                    
+
                     pendingFiles.push(results);
-                    
+
                     clearTimeout(mergeTimeout);
                     mergeTimeout = setTimeout(() => {
                         if (pendingFiles.length > 0) mergePendingFiles();
@@ -3035,13 +3246,13 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 }
             });
         }
-        
+
         function mergePendingFiles() {
             pendingFiles.sort((a, b) => b.data.length - a.data.length);
-            
+
             pendingFiles.forEach(results => {
                 let rCols = results.meta.fields;
-                
+
                 if(rCols.includes('Energy_kcal_mol') && !rCols.includes('OpenMM_Energy_kcal_mol')) {
                     results.data.forEach(d => d['OpenMM_Energy_kcal_mol'] = d['Energy_kcal_mol']);
                     rCols.push('OpenMM_Energy_kcal_mol');
@@ -3050,19 +3261,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     results.data.forEach(d => d['OpenMM_Energy_kcal_mol'] = d['Energy']);
                     rCols.push('OpenMM_Energy_kcal_mol');
                 }
-                
+
                 if (globalData.length === 0) {
-                    globalData = results.data; 
+                    globalData = results.data;
                     cols = rCols;
                 } else {
                     let newCols = rCols.filter(c => !cols.includes(c));
                     if (newCols.length > 0) {
                         let dataMap = new Map();
-                        results.data.forEach(d => { 
+                        results.data.forEach(d => {
                             let df = (d['Frame'] !== undefined) ? d['Frame'] : d['Frame_Index'];
-                            if (df !== undefined) dataMap.set(df, d); 
+                            if (df !== undefined) dataMap.set(df, d);
                         });
-                        
+
                         globalData.forEach(g => {
                             let f = (g['Frame'] !== undefined) ? g['Frame'] : g['Frame_Index'];
                             if (dataMap.has(f)) {
@@ -3071,16 +3282,16 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                             }
                         });
                         cols = [...cols, ...newCols];
-                        alert("✅ Successfully merged new dataset into existing plots!");
+                        showStatus("✅ Successfully merged new dataset into existing plots!");
                     }
                 }
             });
-            
+
             pendingFiles = [];
-            populateDropdowns(); 
+            populateDropdowns();
             updatePlots();
         }
-        
+
         function exportCSV() {
             if(globalData.length === 0) return;
             const csv = Papa.unparse(globalData);
@@ -3094,7 +3305,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             link.click();
             document.body.removeChild(link);
         }
-        
+
         function populateDropdowns() {
             const sels = ['sel-x', 'sel-y', 'sel-z', 'sel-color'];
             const prevVals = {};
@@ -3106,7 +3317,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 const el = document.getElementById(id);
                 if(id !== 'sel-z') el.innerHTML = '';
                 else el.innerHTML = '<option value="none">None (2D Plot)</option>';
-                cols.forEach(c => { el.innerHTML += `<option value="${c}">${c}</option>`; });
+                cols.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = c;
+                    opt.textContent = c;
+                    el.appendChild(opt);
+                });
             });
 
             const pc1_col = cols.find(c => c.startsWith('PCA_1'));
@@ -3150,12 +3366,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 selColor.value = 'PCA_KMeans_Cluster';
             }
         }
-        
-        ['sel-x', 'sel-y', 'sel-z', 'sel-color', 'sel-filter-dataset'].forEach(id => { 
+
+        ['sel-x', 'sel-y', 'sel-z', 'sel-color', 'sel-filter-dataset'].forEach(id => {
             const el = document.getElementById(id);
-            if (el) el.addEventListener('change', updatePlots); 
+            if (el) el.addEventListener('change', updatePlots);
         });
-        
+
         let customSettings = {
             title: 'Structural Landscape',
             fontFamily: 'Playfair Display, Georgia, serif',
@@ -3179,63 +3395,68 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             format: 'png'
         };
 
+        function parseVal(v) {
+            if (v === null || v === undefined) return null;
+            if (typeof v === 'number') return (isNaN(v) || !isFinite(v)) ? null : v;
+            let s = String(v).trim();
+            if (s === '' || s.toLowerCase() === 'null' || s.toLowerCase() === 'nan' || s.toLowerCase() === 'n/a' || s.toLowerCase() === 'undefined') return null;
+            let n = parseFloat(s);
+            return (isNaN(n) || !isFinite(n)) ? null : n;
+        }
+
         function updatePlots() {
             if(globalLoadings.length > 0) {
                 document.getElementById('loadings-plot').style.display = 'block';
                 Plotly.react('loadings-plot', [
                     { x: globalLoadings.map(d=>d.Residue), y: globalLoadings.map(d=>d.PC1_Contribution), name: 'PC1', type: 'scatter', mode: 'lines+markers', line: {color: '#1b3a30'} },
                     { x: globalLoadings.map(d=>d.Residue), y: globalLoadings.map(d=>d.PC2_Contribution), name: 'PC2', type: 'scatter', mode: 'lines+markers', line: {color: '#d4af37'} }
-                ], { title: {text: 'PCA Loadings (Residue Contribution)', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Residue Number'}, yaxis: {title: 'Loading Magnitude'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
+                ], { title: {text: 'PCA Loadings (Residue Contribution)', font: {family: customSettings.fontFamily, color: customSettings.fontColor}}, xaxis: {title: 'Residue Number'}, yaxis: {title: 'Loading Magnitude (RMS, Å)'}, paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)' }, {responsive: true});
             }
-            
+
             if(!globalData.length) return;
             const ph = document.getElementById('main-plot-placeholder');
             if (ph) { ph.style.display = 'none'; ph.remove(); }
-            
+
             let plotData = globalData;
             const selDataset = document.getElementById('sel-filter-dataset') ? document.getElementById('sel-filter-dataset').value : 'all';
             if (selDataset && selDataset !== 'all' && cols.includes('Dataset')) {
                 plotData = plotData.filter(d => d['Dataset'] === selDataset);
             }
             if(document.getElementById('filter-energy') && document.getElementById('filter-energy').checked && cols.includes('OpenMM_Energy_kcal_mol')) {
-                plotData = plotData.filter(d => d['OpenMM_Energy_kcal_mol'] !== undefined && d['OpenMM_Energy_kcal_mol'] !== null && d['OpenMM_Energy_kcal_mol'] !== '');
+                plotData = plotData.filter(d => parseVal(d['OpenMM_Energy_kcal_mol']) !== null);
             }
-            if(!plotData.length) plotData = globalData;
-            
+            if(!plotData.length) {
+                showStatus("⚠️ No frames match the current filter criteria (0 matches).", true);
+                Plotly.react('main-plot', [], { title: { text: 'No matching frames for current filter', font: { family: customSettings.fontFamily, color: customSettings.fontColor } } }, { responsive: true });
+                return;
+            }
+            showStatus('');
+
             const cx = document.getElementById('sel-x').value;
             const cy = document.getElementById('sel-y').value;
             const cz = document.getElementById('sel-z').value;
             const cColor = document.getElementById('sel-color').value;
             const cScale = document.getElementById('sel-colorscale') ? document.getElementById('sel-colorscale').value : 'Viridis';
-            
+
             const x = plotData.map(d => d[cx]);
             const y = plotData.map(d => d[cy]);
             const color = plotData.map(d => d[cColor]);
             const frames = plotData.map(d => (d['Frame'] !== undefined) ? d['Frame'] : d['Frame_Index']);
             const hovertext = plotData.map(d => `Frame: ${(d['Frame'] !== undefined) ? d['Frame'] : d['Frame_Index']}<br>${cColor}: ${d[cColor]}${d['Dataset'] ? '<br>Dataset: ' + d['Dataset'] : ''}`);
-            
+
             const colorMode = document.getElementById('sel-color-mode') ? document.getElementById('sel-color-mode').value : 'binned';
             const csContainer = document.getElementById('colorscale-container');
             const cmContainer = document.getElementById('color-mode-container');
 
-            function parseVal(v) {
-                if (v === null || v === undefined) return null;
-                if (typeof v === 'number') return isNaN(v) ? null : v;
-                let s = String(v).trim();
-                if (s === '' || s.toLowerCase() === 'null' || s.toLowerCase() === 'nan' || s.toLowerCase() === 'n/a' || s.toLowerCase() === 'undefined') return null;
-                let n = parseFloat(s);
-                return isNaN(n) ? null : n;
-            }
-
             let numericVals = color.map(v => parseVal(v));
             let validNums = numericVals.filter(v => v !== null);
             let validCount = validNums.length;
-            
+
             const isEnergy = cColor.toLowerCase().includes('energy');
             const isExplicitCategory = ['dataset', 'cluster', 'label', 'method'].some(k => cColor.toLowerCase().includes(k));
             const uniqueValCount = new Set(color.map(v => (v === null || v === undefined) ? '' : String(v).trim())).size;
             const isCategory = isExplicitCategory || (!isEnergy && !['pca', 'rmsd', 'tsne', 'loading'].some(k => cColor.toLowerCase().includes(k)) && uniqueValCount <= 40);
-            
+
             if (isCategory) {
                 if (cmContainer) cmContainer.style.display = 'none';
                 if (csContainer) csContainer.style.display = 'none';
@@ -3248,7 +3469,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             }
 
             let traces = [];
-            
+
             if (isCategory && color.length > 0) {
                 const catPalette = [
                     '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -3281,7 +3502,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: indices.map(i => plotData[i])
                     };
-                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = indices.map(i => plotData[i][cz]); } 
+                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = indices.map(i => plotData[i][cz]); }
                     else { trace.type = 'scatter'; }
                     traces.push(trace);
                 });
@@ -3297,18 +3518,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: plotData
                     };
-                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = plotData.map(d => d[cz]); } 
+                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = plotData.map(d => d[cz]); }
                     else { trace.type = 'scatter'; }
                     traces.push(trace);
                 } else {
                     const sorted = [...validNums].sort((a, b) => a - b);
                     const nValid = sorted.length;
-                    
+
                     const q1 = sorted[Math.floor(nValid * 0.25)];
                     const med = sorted[Math.floor(nValid * 0.50)];
                     const q3 = sorted[Math.floor(nValid * 0.75)];
                     const iqr = q3 - q1;
-                    
+
                     // For energy or skewed metrics, calculate robust cutoff
                     const p90 = sorted[Math.floor(nValid * 0.90)];
                     let highCutoff = (iqr > 0) ? (q3 + 1.5 * iqr) : p90;
@@ -3318,19 +3539,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         if (highCutoff > 2000 && q3 < 2000) highCutoff = Math.max(q3, 1500);
                     }
                     let lowCutoff = (iqr > 0) ? (q1 - 1.5 * iqr) : sorted[0];
-                    
+
                     const repVals = sorted.filter(v => v >= lowCutoff && v <= highCutoff);
                     const repMin = repVals.length > 0 ? repVals[0] : sorted[0];
                     const repMax = repVals.length > 0 ? repVals[repVals.length - 1] : highCutoff;
                     const nRep = repVals.length;
-                    
+
                     const b1 = repVals[Math.floor(nRep * 0.20)] || repMin;
                     const b2 = repVals[Math.floor(nRep * 0.40)] || b1;
                     const b3 = repVals[Math.floor(nRep * 0.60)] || b2;
                     const b4 = repVals[Math.floor(nRep * 0.80)] || b3;
-                    
+
                     const colors = ['#059669', '#0d9488', '#0284c7', '#d97706', '#dc2626'];
-                    
+
                     let hasLowOutliers = (lowCutoff > sorted[0]);
                     let buckets = [];
                     if (hasLowOutliers) {
@@ -3345,7 +3566,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         { name: `⚫ High Outliers / Clashes (> ${highCutoff.toFixed(1)})`, color: '#111111', indices: [] },
                         { name: `❌ Clashes / NaN`, color: '#4b5563', indices: [] }
                     );
-                    
+
                     const offset = hasLowOutliers ? 1 : 0;
                     for (let i = 0; i < plotData.length; i++) {
                         const val = numericVals[i];
@@ -3367,7 +3588,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                             buckets[offset + 4].indices.push(i);
                         }
                     }
-                    
+
                     buckets.forEach(b => {
                         if (b.indices.length > 0) {
                             let isHighOutlier = b.name.includes('High Outliers');
@@ -3387,7 +3608,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                                 hoverinfo: 'text+x+y+z',
                                 customdata: b.indices.map(i => plotData[i])
                             };
-                            if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = b.indices.map(i => plotData[i][cz]); } 
+                            if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = b.indices.map(i => plotData[i][cz]); }
                             else { trace.type = 'scatter'; }
                             traces.push(trace);
                         }
@@ -3433,7 +3654,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: validIndices.map(i => plotData[i])
                     };
-                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = validIndices.map(i => plotData[i][cz]); } 
+                    if (cz !== 'none') { trace.type = 'scatter3d'; trace.z = validIndices.map(i => plotData[i][cz]); }
                     else { trace.type = 'scatter'; }
                     traces.push(trace);
                 }
@@ -3454,12 +3675,12 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                         hoverinfo: 'text+x+y+z',
                         customdata: nanIndices.map(i => plotData[i])
                     };
-                    if (cz !== 'none') { nanTrace.type = 'scatter3d'; nanTrace.z = nanIndices.map(i => plotData[i][cz]); } 
+                    if (cz !== 'none') { nanTrace.type = 'scatter3d'; nanTrace.z = nanIndices.map(i => plotData[i][cz]); }
                     else { nanTrace.type = 'scatter'; }
                     traces.push(nanTrace);
                 }
             }
-            
+
             let liveBg = 'rgba(0,0,0,0)';
             if (customSettings.bgMode === 'white') liveBg = '#ffffff';
             else if (customSettings.bgMode === 'cream') liveBg = '#f4f1ea';
@@ -3490,20 +3711,27 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 showlegend: customSettings.legendPos !== 'none',
                 legend: (customSettings.legendPos !== 'none') ? legendConfig : undefined,
                 xaxis: {
-                    title: { text: cx, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    title: { text: formatAxisLabel(cx), font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
                     tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
                     showgrid: customSettings.showGrid,
                     gridcolor: customSettings.gridColor,
                     zeroline: customSettings.showZeroLine
                 },
                 yaxis: {
-                    title: { text: cy, font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
+                    title: { text: formatAxisLabel(cy), font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
                     tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },
                     showgrid: customSettings.showGrid,
                     gridcolor: customSettings.gridColor,
                     zeroline: customSettings.showZeroLine
                 }
             };
+            if (cz !== 'none') {
+                layout.scene = {
+                    xaxis: { title: formatAxisLabel(cx), showgrid: customSettings.showGrid, gridcolor: customSettings.gridColor },
+                    yaxis: { title: formatAxisLabel(cy), showgrid: customSettings.showGrid, gridcolor: customSettings.gridColor },
+                    zaxis: { title: formatAxisLabel(cz), showgrid: customSettings.showGrid, gridcolor: customSettings.gridColor }
+                };
+            }
 
             const plotConfig = {
                 responsive: true,
@@ -3517,9 +3745,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 }],
                 modeBarButtonsToRemove: ['toImage']
             };
-            
+
             Plotly.react('main-plot', traces, layout, plotConfig);
-            
+
             const mainPlotEl = document.getElementById('main-plot');
             if (!mainPlotEl._hasClickBound) {
                 mainPlotEl._hasClickBound = true;
@@ -3529,18 +3757,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                     const cluster = custom[cColor];
                     const ds_tag = custom['Dataset'] ? ` (${custom['Dataset']})` : '';
                     const energy = (custom['OpenMM_Energy_kcal_mol'] !== undefined && custom['OpenMM_Energy_kcal_mol'] !== null && !isNaN(custom['OpenMM_Energy_kcal_mol'])) ? custom['OpenMM_Energy_kcal_mol'] : 'N/A (Steric Clash / Uncalculated)';
-                    
+
                     document.getElementById('modal-frame').innerText = frame;
                     document.getElementById('modal-cluster').innerText = (cluster !== undefined && cluster !== null) ? (cluster + ds_tag) : ('N/A' + ds_tag);
                     document.getElementById('modal-energy').innerText = energy;
-                    
+
                     const code = `# Load unified trajectory in PyMOL:\nload merged_reference.pdb\nload_traj merged_trajectory.xtc, merged_reference\ncmd.frame(${frame + 1})\nsave frame_${frame}_extracted.pdb, merged_reference, state=${frame + 1}\nprint("Viewing Frame ${frame} (State ${frame + 1})")`;
                     document.getElementById('pymol-code').innerText = code;
                     document.getElementById('overlay').style.display = 'block';
                     document.getElementById('pymol-modal').style.display = 'block';
                 });
             }
-            
+
             if(cols.includes('OpenMM_Energy_kcal_mol')) {
                 const e_vals = plotData.map(d => Number(d['OpenMM_Energy_kcal_mol'])).filter(v => v !== null && v !== undefined && !isNaN(v));
                 if (e_vals.length > 0) {
@@ -3567,7 +3795,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('exp-tick-size').value = customSettings.tickSize;
             document.getElementById('lbl-tick-size').innerText = customSettings.tickSize + ' px';
             document.getElementById('exp-font-color').value = customSettings.fontColor;
-            
+
             document.getElementById('exp-marker-size').value = customSettings.markerSize;
             document.getElementById('lbl-marker-size').innerText = customSettings.markerSize + ' px';
             document.getElementById('exp-marker-opacity').value = customSettings.markerOpacity;
@@ -3576,19 +3804,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('lbl-border-width').innerText = customSettings.borderWidth + ' px';
             document.getElementById('exp-border-color').value = customSettings.borderColor;
             document.getElementById('exp-legend-pos').value = customSettings.legendPos;
-            
+
             document.getElementById('exp-bg-mode').value = customSettings.bgMode;
             toggleCustomBgInput(customSettings.bgMode);
             document.getElementById('exp-custom-bg').value = customSettings.customBg;
             document.getElementById('exp-show-grid').checked = customSettings.showGrid;
             document.getElementById('exp-grid-color').value = customSettings.gridColor;
             document.getElementById('exp-show-zeroline').checked = customSettings.showZeroLine;
-            
+
             document.getElementById('exp-width').value = customSettings.width;
             document.getElementById('exp-height').value = customSettings.height;
             document.getElementById('exp-scale').value = customSettings.scale;
             document.getElementById('exp-format').value = customSettings.format;
-            
+
             document.getElementById('overlay').style.display = 'block';
             document.getElementById('export-modal').style.display = 'block';
         }
@@ -3619,19 +3847,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             customSettings.axisLabelSize = parseInt(document.getElementById('exp-axis-size').value) || 14;
             customSettings.tickSize = parseInt(document.getElementById('exp-tick-size').value) || 11;
             customSettings.fontColor = document.getElementById('exp-font-color').value;
-            
+
             customSettings.markerSize = parseFloat(document.getElementById('exp-marker-size').value) || 5;
             customSettings.markerOpacity = parseFloat(document.getElementById('exp-marker-opacity').value) || 0.85;
             customSettings.borderWidth = parseFloat(document.getElementById('exp-border-width').value) || 0;
             customSettings.borderColor = document.getElementById('exp-border-color').value;
             customSettings.legendPos = document.getElementById('exp-legend-pos').value;
-            
+
             customSettings.bgMode = document.getElementById('exp-bg-mode').value;
             customSettings.customBg = document.getElementById('exp-custom-bg').value;
             customSettings.showGrid = document.getElementById('exp-show-grid').checked;
             customSettings.gridColor = document.getElementById('exp-grid-color').value;
             customSettings.showZeroLine = document.getElementById('exp-show-zeroline').checked;
-            
+
             customSettings.width = parseInt(document.getElementById('exp-width').value) || 1920;
             customSettings.height = parseInt(document.getElementById('exp-height').value) || 1080;
             customSettings.scale = parseFloat(document.getElementById('exp-scale').value) || 2;
@@ -3646,7 +3874,7 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 
         function downloadCustomImage() {
             updateSettingsFromModal();
-            
+
             let exportBg = '#ffffff';
             if (customSettings.bgMode === 'transparent') exportBg = 'rgba(0,0,0,0)';
             else if (customSettings.bgMode === 'cream') exportBg = '#f4f1ea';
@@ -3705,20 +3933,19 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
-
 def generate_dashboard(out_dir: str, df: Optional[pd.DataFrame] = None) -> str:
     """Generate metflow_dashboard.html with embedded JSON metrics."""
     os.makedirs(out_dir, exist_ok=True)
     html = DASHBOARD_HTML_TEMPLATE
     if df is not None:
-        df_json = df.to_json(orient="records")
+        df_json = df.to_json(orient="records").replace("</", "<\\/")
         html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
     else:
         csv_file = os.path.join(out_dir, "global_cluster_metrics.csv")
         if os.path.exists(csv_file):
             try:
                 df_dash = pd.read_csv(csv_file)
-                df_json = df_dash.to_json(orient="records")
+                df_json = df_dash.to_json(orient="records").replace("</", "<\\/")
                 html = html.replace("/*EMBEDDED_DATA_PLACEHOLDER*/[]", df_json)
             except Exception:
                 pass
@@ -3742,12 +3969,59 @@ import seaborn as sns
 from sklearn.manifold import TSNE
 
 
-def _get_dataset_palette(n_ds: int):
+OKABE_ITO_PALETTE = [
+    "#0072B2", "#D55E00", "#009E73", "#CC79A7",
+    "#E69F00", "#56B4E9", "#F0E442", "#000000",
+]
+
+
+def _get_dataset_palette(n_ds: int) -> List[Any]:
+    if n_ds <= len(OKABE_ITO_PALETTE):
+        return OKABE_ITO_PALETTE[:max(1, n_ds)]
     if n_ds <= 10:
-        return sns.color_palette("tab10", max(1, n_ds))
+        return sns.color_palette("tab10", n_ds)
     if n_ds <= 20:
         return sns.color_palette("tab20", n_ds)
     return sns.color_palette("husl", n_ds)
+
+
+def _plot_discrete_clusters(
+    x_vals: Any,
+    y_vals: Any,
+    cluster_vals: Any,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    out_path: str,
+) -> None:
+    """Plot discrete cluster scatter with colorblind-safe palette and explicit legend."""
+    unique_cids = sorted(set(cluster_vals), key=lambda c: (c == -1, c))
+    non_noise = [c for c in unique_cids if c != -1]
+    palette = _get_dataset_palette(len(non_noise))
+    color_map = {cid: palette[i % len(palette)] for i, cid in enumerate(non_noise)}
+    color_map[-1] = "#7F7F7F"
+
+    plt.figure(figsize=(10, 8))
+    x_arr = np.asarray(x_vals)
+    y_arr = np.asarray(y_vals)
+    c_arr = np.asarray(cluster_vals)
+    for cid in unique_cids:
+        mask = c_arr == cid
+        lbl = f"Noise / Unclustered (-1) (n={int(np.sum(mask))})" if cid == -1 else f"Cluster {cid} (n={int(np.sum(mask))})"
+        plt.scatter(
+            x_arr[mask],
+            y_arr[mask],
+            color=color_map[cid],
+            label=lbl,
+            alpha=0.45 if cid == -1 else 0.7,
+            s=8 if cid == -1 else 14,
+        )
+    plt.legend(title=title, bbox_to_anchor=(1.05, 1), loc="upper left", markerscale=1.5)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 
 def generate_comparison_plots(
@@ -3802,8 +4076,8 @@ def generate_comparison_plots(
                 vmin=vmin,
                 vmax=vmax,
             )
-            plt.colorbar(scatter, label="Energy (kcal/mol)")
-            plt.title("Free Energy Landscape (PCA colored by OpenMM Energy)")
+            plt.colorbar(scatter, label="Potential Energy (kcal/mol)", extend="max")
+            plt.title("Free Energy Landscape (PCA colored by OpenMM Energy, kcal/mol)")
             plt.xlabel(pc1_col_name)
             plt.ylabel(pc2_col_name)
             en_plot_path = os.path.join(out_dir, "energy_landscape_plot.png")
@@ -3871,15 +4145,16 @@ def generate_cluster_plots(
         ("CNN_Cluster", "CNN/DBSCAN Clusters", "cnn_plot.png"),
     ]:
         if cluster_col in df.columns:
-            plt.figure(figsize=(10, 8))
-            scatter = plt.scatter(df[pc1_col], df[pc2_col], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
-            plt.colorbar(scatter, label=title)
-            plt.title(f"PCA Projection ({title})")
-            plt.xlabel(f"Principal Component 1 ({var_explained[0]:.1f}%)")
-            plt.ylabel(f"Principal Component 2 ({var_explained[1]:.1f}%)")
             out_path = os.path.join(out_dir, out_name)
-            plt.savefig(out_path, dpi=300, bbox_inches="tight")
-            plt.close()
+            _plot_discrete_clusters(
+                df[pc1_col],
+                df[pc2_col],
+                df[cluster_col],
+                title=f"PCA Projection ({title})",
+                xlabel=f"Principal Component 1 ({var_explained[0]:.1f}%)",
+                ylabel=f"Principal Component 2 ({var_explained[1]:.1f}%)",
+                out_path=out_path,
+            )
             print(f"Saved 2D Cluster Graph to {out_path}")
             artifacts.append(out_path)
     return artifacts
@@ -3934,15 +4209,16 @@ def generate_advanced_plots(
             ("CNN_Cluster", "CNN/DBSCAN Clusters", "tsne_cnn_plot.png"),
         ]:
             if cluster_col in df.columns:
-                plt.figure(figsize=(10, 8))
-                scatter = plt.scatter(df["tSNE_1"], df["tSNE_2"], c=df[cluster_col], cmap="tab20", alpha=0.6, s=10)
-                plt.colorbar(scatter, label=title)
-                plt.title(f"t-SNE Projection ({title})")
-                plt.xlabel("t-SNE Dimension 1")
-                plt.ylabel("t-SNE Dimension 2")
                 out_path = os.path.join(out_dir, out_name)
-                plt.savefig(out_path, dpi=300, bbox_inches="tight")
-                plt.close()
+                _plot_discrete_clusters(
+                    df["tSNE_1"],
+                    df["tSNE_2"],
+                    df[cluster_col],
+                    title=f"t-SNE Projection ({title})",
+                    xlabel="t-SNE Dimension 1",
+                    ylabel="t-SNE Dimension 2",
+                    out_path=out_path,
+                )
                 print(f"Saved t-SNE Graph to {out_path}")
                 artifacts.append(out_path)
                 methodology.append(f"Generated t-SNE non-linear projection for {title}.")
@@ -4015,10 +4291,10 @@ def generate_pca_loadings(
 
     plot_path = os.path.join(out_dir, "pca_loadings_plot.png")
     plt.figure(figsize=(12, 5))
-    plt.plot(all_resids, pc1_full, label="PC1 Contribution", alpha=0.8, color="blue", marker=".", markersize=4)
-    plt.plot(all_resids, pc2_full, label="PC2 Contribution", alpha=0.8, color="orange", marker=".", markersize=4)
+    plt.plot(all_resids, pc1_full, label="PC1 Contribution", alpha=0.85, color="#0072B2", marker=".", markersize=4)
+    plt.plot(all_resids, pc2_full, label="PC2 Contribution", alpha=0.85, color="#D55E00", marker=".", markersize=4)
     plt.xlabel("Residue Number")
-    plt.ylabel("Loading Magnitude (RMS)")
+    plt.ylabel("Loading Magnitude (RMS, Å)")
     plt.title("Per-Residue Contribution to Principal Components")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -4031,11 +4307,12 @@ EOF
 cat << 'EOF' > "$INSTALL_DIR/metflow/stage6_visualization/reports.py"
 """Text reports (cluster summary, methodology) and Stage 6 orchestration."""
 
+import datetime
 import os
-from typing import List
+from typing import List, Optional
 import pandas as pd
 
-from metflow.models import StageResult, TrajectoryContext
+from metflow.models import PipelineConfig, StageResult, TrajectoryContext
 from metflow.stage6_visualization.dashboard import generate_dashboard
 from metflow.stage6_visualization.plots import (
     generate_advanced_plots,
@@ -4045,26 +4322,140 @@ from metflow.stage6_visualization.plots import (
 )
 
 
-def write_cluster_summary(df: pd.DataFrame, out_dir: str, unique_datasets: List[str]) -> str:
-    """Write dataset_cluster_summary.txt with per-dataset counts and cross-tabulations."""
-    summary_lines = [
-        "=== Multi-Trajectory Dataset Cluster Distribution Summary ===",
-        f"Total Datasets: {len(unique_datasets)}",
-        f"Total Frames: {len(df)}\n",
-    ]
-    for ds in unique_datasets:
-        ds_count = len(df[df["Dataset"] == ds])
-        summary_lines.append(f"Dataset '{ds}': {ds_count} frames ({ds_count / len(df) * 100:.1f}%)")
+def init_methodology(ctx: TrajectoryContext, mode_label: str = "Standard Analysis") -> str:
+    """Initialize or append a timestamped session header to out_dir/methodology.txt."""
+    out_dir = ctx.out_dir or (ctx.config.out_dir if ctx.config else "")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "methodology.txt")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"=== MET Flow Session: {timestamp} | Mode: {mode_label} ==="
 
-    for cluster_col in ["PCA_KMeans_Cluster", "Daura_Cluster", "CNN_Cluster"]:
-        if cluster_col in df.columns:
-            summary_lines.append(f"\n--- Cross-Tabulation: {cluster_col} ---")
-            ct = pd.crosstab(df[cluster_col], df["Dataset"], margins=True)
-            ct_pct = pd.crosstab(df[cluster_col], df["Dataset"], normalize="index") * 100
-            summary_lines.append("Counts:")
-            summary_lines.append(ct.to_string())
-            summary_lines.append("\nRow Percentages (%):")
-            summary_lines.append(ct_pct.round(1).to_string())
+    ctx.methodology.append(header)
+    file_exists = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    with open(out_path, "a", encoding="utf-8") as f:
+        if file_exists:
+            f.write("\n")
+        f.write(header + "\n")
+        f.flush()
+    return out_path
+
+
+def log_methodology(ctx: TrajectoryContext, entry: str) -> None:
+    """Append an entry to ctx.methodology and immediately flush to out_dir/methodology.txt."""
+    if not entry:
+        return
+    ctx.methodology.append(entry)
+    out_dir = ctx.out_dir or (ctx.config.out_dir if ctx.config else "")
+    if not out_dir:
+        return
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "methodology.txt")
+    with open(out_path, "a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+
+
+def write_cluster_summary(
+    df: pd.DataFrame,
+    out_dir: str,
+    unique_datasets: List[str],
+    config: Optional[PipelineConfig] = None,
+) -> str:
+    """Write dataset_cluster_summary.txt with per-dataset stats and full cross-tabulations."""
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    summary_lines = [
+        "============================================================",
+        "  MET Flow - Multi-Trajectory Dataset & Cluster Summary",
+        "============================================================",
+        f"Generated: {timestamp}",
+        f"Total Datasets: {len(unique_datasets)}",
+        f"Total Frames: {len(df)}",
+    ]
+
+    if config is not None:
+        summary_lines.extend([
+            "",
+            "--- Clustering Parameters ---",
+            f"  Method(s): {config.cluster}",
+            f"  K-Means k: {config.k}",
+            f"  Daura RMSD Cutoff: {config.rmsd} Å",
+            f"  CNN/DBSCAN eps: {config.cnn_eps} Å",
+        ])
+
+    if len(df) == 0:
+        summary_lines.append("\nNo frames available for summary statistics.")
+        out_path = os.path.join(out_dir, "dataset_cluster_summary.txt")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(summary_lines) + "\n")
+        print(f"Saved dataset cluster summary report to {out_path}")
+        return out_path
+
+    summary_lines.append("")
+    summary_lines.append("--- Per-Dataset Frame Counts ---")
+    total_frames = len(df)
+    ds_counts = df["Dataset"].value_counts().to_dict()
+    for ds in unique_datasets:
+        ds_count = int(ds_counts.get(ds, 0))
+        summary_lines.append(f"Dataset '{ds}': {ds_count} frames ({ds_count / total_frames * 100:.1f}%)")
+
+    rmsd_col = "RMSD_to_Reference" if "RMSD_to_Reference" in df.columns else (
+        "RMSD_to_Ref" if "RMSD_to_Ref" in df.columns else None
+    )
+    energy_col = "OpenMM_Energy_kcal_mol" if "OpenMM_Energy_kcal_mol" in df.columns else None
+
+    if rmsd_col or energy_col:
+        summary_lines.append("\n--- Per-Dataset Quantitative Summary ---")
+        rmsd_stats = None
+        if rmsd_col:
+            rmsd_stats = (
+                pd.to_numeric(df[rmsd_col], errors="coerce")
+                .groupby(df["Dataset"], sort=False)
+                .agg(["count", "mean", "std", "min", "median", "max"])
+            )
+        en_stats = None
+        if energy_col:
+            en_stats = (
+                pd.to_numeric(df[energy_col], errors="coerce")
+                .groupby(df["Dataset"], sort=False)
+                .agg(["count", "mean", "std", "min", "median", "max"])
+            )
+        for ds in unique_datasets:
+            summary_lines.append(f"Dataset '{ds}':")
+            if rmsd_stats is not None and ds in rmsd_stats.index:
+                r = rmsd_stats.loc[ds]
+                if r["count"] > 0:
+                    summary_lines.append(
+                        f"  RMSD to Reference (Å): mean={r['mean']:.3f} ± {r['std']:.3f}, "
+                        f"min={r['min']:.3f}, median={r['median']:.3f}, max={r['max']:.3f}"
+                    )
+            if en_stats is not None and ds in en_stats.index:
+                e = en_stats.loc[ds]
+                if e["count"] > 0:
+                    ds_total = int(ds_counts.get(ds, 0))
+                    summary_lines.append(
+                        f"  OpenMM Energy (kcal/mol): mean={e['mean']:.2f} ± {e['std']:.2f}, "
+                        f"min={e['min']:.2f}, median={e['median']:.2f}, max={e['max']:.2f} "
+                        f"(valid={int(e['count'])}/{ds_total})"
+                    )
+
+    with pd.option_context("display.max_rows", None, "display.max_columns", None, "display.width", 1000):
+        for cluster_col in ["PCA_KMeans_Cluster", "Daura_Cluster", "CNN_Cluster"]:
+            if cluster_col in df.columns:
+                summary_lines.append(f"\n--- Cross-Tabulation: {cluster_col} ---")
+                ct_raw = pd.crosstab(df[cluster_col], df["Dataset"])
+                row_sums = ct_raw.sum(axis=1)
+                ct_pct = ct_raw.div(row_sums, axis=0) * 100
+                ct = ct_raw.copy()
+                ct["All"] = row_sums
+                ct.loc["All"] = ct.sum(axis=0)
+                if cluster_col == "CNN_Cluster":
+                    ct = ct.rename(index={-1: "Noise / Unclustered (-1)"})
+                    ct_pct = ct_pct.rename(index={-1: "Noise / Unclustered (-1)"})
+                summary_lines.append("Counts:")
+                summary_lines.append(ct.to_string())
+                summary_lines.append("\nRow Percentages (%):")
+                summary_lines.append(ct_pct.round(1).to_string())
 
     out_path = os.path.join(out_dir, "dataset_cluster_summary.txt")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -4074,7 +4465,8 @@ def write_cluster_summary(df: pd.DataFrame, out_dir: str, unique_datasets: List[
 
 
 def write_methodology(methodology: List[str], out_dir: str) -> str:
-    """Write methodology.txt."""
+    """Write methodology.txt (backward-compatible batch writer)."""
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "methodology.txt")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(methodology) + "\n")
@@ -4090,6 +4482,7 @@ def run_stage6(ctx: TrajectoryContext) -> StageResult:
     artifacts: List[str] = []
 
     print("\n--- Generating Final Outputs ---")
+    log_methodology(ctx, "\n--- Stage 6: Visualization & Reports ---")
     df = pd.DataFrame(ctx.df_data)
     try:
         df.rename(
@@ -4112,12 +4505,15 @@ def run_stage6(ctx: TrajectoryContext) -> StageResult:
     dash_path = generate_dashboard(out_dir, df=df)
     print(f"🌟 Generated interactive Dashboard (with embedded data for zero-CORS offline browsing!): {dash_path}")
     artifacts.append(dash_path)
+    log_methodology(ctx, f"Exported global_cluster_metrics.csv ({len(df)} frames) and metflow_dashboard.html.")
 
     cmp_artifacts, unique_datasets, palette = generate_comparison_plots(df, out_dir)
     artifacts.extend(cmp_artifacts)
 
+    meth_path = os.path.join(out_dir, "methodology.txt")
     if config.is_only_energy:
-        artifacts.append(write_methodology(ctx.methodology, out_dir))
+        log_methodology(ctx, "Stage 6 completed (Energy Only mode).")
+        artifacts.append(meth_path)
         print("==================================================")
         print(" ✅ Option [C] Energy ONLY Evaluation Complete!")
         print("==================================================")
@@ -4129,18 +4525,24 @@ def run_stage6(ctx: TrajectoryContext) -> StageResult:
             metrics={"only_energy": True, "n_frames": len(df)},
         )
 
-    artifacts.append(write_cluster_summary(df, out_dir, unique_datasets))
+    artifacts.append(write_cluster_summary(df, out_dir, unique_datasets, config=config))
     artifacts.extend(generate_cluster_plots(df, out_dir, var_explained))
 
     if config.is_advanced_plots:
+        prev_len = len(ctx.methodology)
         artifacts.extend(
             generate_advanced_plots(
                 df, ctx.X, ctx.rmsd_matrix, out_dir, unique_datasets, palette, ctx.methodology
             )
         )
+        new_entries = ctx.methodology[prev_len:]
+        if new_entries:
+            with open(meth_path, "a", encoding="utf-8") as f:
+                f.write("\n".join(new_entries) + "\n")
 
     artifacts.extend(generate_pca_loadings(ctx.pca_model, ctx.ref_bb_atoms, out_dir))
-    artifacts.append(write_methodology(ctx.methodology, out_dir))
+    log_methodology(ctx, "Stage 6 completed successfully (plots, PCA loadings, and cluster summary exported).")
+    artifacts.append(meth_path)
 
     print(f"\n✅ Post-Generation Analysis Complete! Results saved to {out_dir}/ directory.")
     print("==================================================")
@@ -4194,9 +4596,24 @@ validate_out_dir() {
     if [ -z "$target" ]; then
         return 0
     fi
-    if [[ "$target" =~ (^|/)\.\.(/|$) ]] || [[ "$target" = /* ]]; then
+    if [[ "$target" =~ (^|/)\.\.(/|$) ]]; then
         echo "❌ Error: Directory traversal blocked: $target" >&2
         exit 1
+    fi
+    local cwd
+    cwd=$(pwd -P 2>/dev/null || pwd)
+    local norm_target
+    norm_target=$(realpath -m "$target" 2>/dev/null || echo "")
+    if [ -n "$norm_target" ]; then
+        if [[ "$norm_target" != "$cwd" ]] && [[ "$norm_target" != "$cwd/"* ]]; then
+            echo "❌ Error: Directory traversal blocked: $target" >&2
+            exit 1
+        fi
+    elif [[ "$target" = /* ]]; then
+        if [[ "$target" != "$cwd" ]] && [[ "$target" != "$cwd/"* ]]; then
+            echo "❌ Error: Directory traversal blocked: $target" >&2
+            exit 1
+        fi
     fi
 }
 
@@ -4272,6 +4689,7 @@ only_dashboard=true"
                 min_steps) [ -n "$val" ] && CMD_ARGS+=(--min_steps "$val") ;;
                 allostery) [ "$val" == "true" ] && CMD_ARGS+=(--allostery "true" --advanced_plots "true") ;;
                 pca_ref) [ -n "$val" ] && CMD_ARGS+=(--pca_ref "$val") ;;
+                pca_res) [ -n "$val" ] && CMD_ARGS+=(--pca_res "$val") ;;
                 pdb) [ -n "$val" ] && CMD_ARGS+=(--pdb "$val") ;;
                 xtc) [ -n "$val" ] && CMD_ARGS+=(--xtc "$val") ;;
                 labels|dataset_labels) [ -n "$val" ] && CMD_ARGS+=(--dataset_labels "$val") ;;
@@ -4330,6 +4748,7 @@ calc_energy=${CALC_ENERGY_VAL}
 min_steps=${MIN_STEPS}
 allostery=${ALLOSTERY_VAL}
 pca_ref=${PCA_REF_VAL}
+pca_res=${PCA_RES_VAL}
 pdb=${CUSTOM_PDB:-}
 xtc=${CUSTOM_XTC:-}
 labels=${CUSTOM_LABELS:-}
@@ -4375,6 +4794,9 @@ only_dashboard=${ONLY_DASHBOARD_VAL}"
         echo "  [2] Reference PCA Space (Fit on Dataset 1 'bioemu', project all into it)"
         read -r -p "Selection [1-2] (Default: 1): " pca_ref_choice
 
+        echo ""
+        read -r -p "Restrict Alignment & PCA to specific residues/ranges? (e.g. 10-45, 60 or leave blank for ALL): " pca_res_input
+
         case $cluster_choice in
             2) CLUSTER_OPT="daura" ;;
             3) CLUSTER_OPT="cnn" ;;
@@ -4400,6 +4822,10 @@ only_dashboard=${ONLY_DASHBOARD_VAL}"
         if [[ "$pca_ref_choice" == "2" ]]; then
             PCA_REF_VAL="first"
             CMD_ARGS+=(--pca_ref "first")
+        fi
+        PCA_RES_VAL="${pca_res_input:-}"
+        if [ -n "$PCA_RES_VAL" ]; then
+            CMD_ARGS+=(--pca_res "$PCA_RES_VAL")
         fi
 
         if [ -n "$CUSTOM_PDB" ]; then
@@ -4432,6 +4858,7 @@ calc_energy=${CALC_ENERGY_VAL}
 min_steps=${MIN_STEPS}
 allostery=${ALLOSTERY_VAL}
 pca_ref=${PCA_REF_VAL}
+pca_res=${PCA_RES_VAL}
 pdb=${CUSTOM_PDB:-}
 xtc=${CUSTOM_XTC:-}
 labels=${CUSTOM_LABELS:-}
@@ -4689,11 +5116,14 @@ while true; do
                 CUSTOM_LABELS="${LABEL_ARRAY[*]}"
                 IFS="$old_ifs"
                 IS_MULTI_DATASET="true"
+            else
+                read -p "Output folder name [Default: energy_results]: " out_dir_in
+                CUSTOM_OUT="${out_dir_in:-energy_results}"
             fi
             run_analysis "true"
             ;;
         [Dd])
-            unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS IS_MULTI_DATASET
+            unset CUSTOM_PDB CUSTOM_XTC CUSTOM_LABELS CUSTOM_OUT IS_MULTI_DATASET CUSTOM_CONFIGS
             read -p "Enter results folder containing global_cluster_metrics.csv [Default: clustering_results]: " custom_dash_out
             CUSTOM_OUT="${custom_dash_out:-clustering_results}"
             run_analysis "false" "true"
