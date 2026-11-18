@@ -1840,8 +1840,23 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
         f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%",
     )
 
+    local_counts = {}
+    ds_totals = {}
+    for tag in ctx.dataset_tags:
+        ds_totals[tag] = ds_totals.get(tag, 0) + 1
+    local_frame_idx = np.zeros(len(ctx.valid_frames), dtype=int)
+    ds_progress_pct = np.zeros(len(ctx.valid_frames), dtype=float)
+    for idx_f, tag in enumerate(ctx.dataset_tags):
+        k_local = local_counts.get(tag, 0)
+        local_frame_idx[idx_f] = k_local
+        tot_ds = ds_totals[tag]
+        ds_progress_pct[idx_f] = (100.0 * k_local / (tot_ds - 1)) if tot_ds > 1 else 0.0
+        local_counts[tag] = k_local + 1
+
     ctx.df_data = {
         "Frame_Index": np.arange(len(ctx.valid_frames)),
+        "Local_Frame_Index": local_frame_idx,
+        "Dataset_Progress_Pct": np.round(ds_progress_pct, 2),
         "Dataset": ctx.dataset_tags,
         "RMSD_to_Reference": rmsd_to_ref,
         "PCA_1": X_pca[:, 0],
@@ -3305,7 +3320,31 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             document.body.removeChild(link);
         }
 
+        function ensureLocalFrameColumns() {
+            if (!globalData || globalData.length === 0) return;
+            const hasLocal = cols.includes('Local_Frame_Index');
+            const hasProg = cols.includes('Dataset_Progress_Pct');
+            if (hasLocal && hasProg) return;
+            const totals = {};
+            globalData.forEach(d => {
+                const ds = d['Dataset'] || 'Dataset';
+                totals[ds] = (totals[ds] || 0) + 1;
+            });
+            const counts = {};
+            globalData.forEach(d => {
+                const ds = d['Dataset'] || 'Dataset';
+                const k = counts[ds] || 0;
+                const tot = totals[ds] || 1;
+                if (!hasLocal) d['Local_Frame_Index'] = k;
+                if (!hasProg) d['Dataset_Progress_Pct'] = tot > 1 ? Number((100.0 * k / (tot - 1)).toFixed(2)) : 0;
+                counts[ds] = k + 1;
+            });
+            if (!hasLocal) cols.push('Local_Frame_Index');
+            if (!hasProg) cols.push('Dataset_Progress_Pct');
+        }
+
         function populateDropdowns() {
+            ensureLocalFrameColumns();
             const sels = ['sel-x', 'sel-y', 'sel-z', 'sel-color'];
             const prevVals = {};
             sels.forEach(id => {
@@ -3617,7 +3656,8 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 let cmin = undefined;
                 let cmax = undefined;
                 const sorted = [...validNums].sort((a, b) => a - b);
-                if (sorted.length > 20) {
+                const isIndexOrPct = ['frame', 'progress', 'pct'].some(k => cColor.toLowerCase().includes(k));
+                if (sorted.length > 20 && !isIndexOrPct) {
                     cmin = sorted[Math.floor(sorted.length * 0.05)];
                     cmax = sorted[Math.floor(sorted.length * 0.95)];
                 }
@@ -3701,14 +3741,17 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 legendConfig = { title: { text: cColor }, orientation: 'h', y: -0.22, x: 0, font: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor } };
             }
 
+            const hasColorbar = traces.some(t => t.marker && t.marker.showscale);
+            const showLegendEffective = (customSettings.legendPos !== 'none') && !(hasColorbar && traces.length === 1);
+
             let layout = {
                 title: { text: customSettings.title, font: {family: customSettings.fontFamily, size: customSettings.titleSize, color: customSettings.fontColor} },
                 paper_bgcolor: liveBg,
                 plot_bgcolor: liveBg,
                 margin: {l: 60, r: 60, b: 65, t: 80},
                 font: {family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor},
-                showlegend: customSettings.legendPos !== 'none',
-                legend: (customSettings.legendPos !== 'none') ? legendConfig : undefined,
+                showlegend: showLegendEffective,
+                legend: showLegendEffective ? legendConfig : undefined,
                 xaxis: {
                     title: { text: formatAxisLabel(cx), font: { family: customSettings.fontFamily, size: customSettings.axisLabelSize, color: customSettings.fontColor } },
                     tickfont: { family: customSettings.fontFamily, size: customSettings.tickSize, color: customSettings.fontColor },

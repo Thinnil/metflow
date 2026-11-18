@@ -251,8 +251,23 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
         f"PCA Variance Explained: PC1={var_explained[0]:.1f}%, PC2={var_explained[1]:.1f}%, PC3={var_explained[2]:.1f}%",
     )
 
+    local_counts = {}
+    ds_totals = {}
+    for tag in ctx.dataset_tags:
+        ds_totals[tag] = ds_totals.get(tag, 0) + 1
+    local_frame_idx = np.zeros(len(ctx.valid_frames), dtype=int)
+    ds_progress_pct = np.zeros(len(ctx.valid_frames), dtype=float)
+    for idx_f, tag in enumerate(ctx.dataset_tags):
+        k_local = local_counts.get(tag, 0)
+        local_frame_idx[idx_f] = k_local
+        tot_ds = ds_totals[tag]
+        ds_progress_pct[idx_f] = (100.0 * k_local / (tot_ds - 1)) if tot_ds > 1 else 0.0
+        local_counts[tag] = k_local + 1
+
     ctx.df_data = {
         "Frame_Index": np.arange(len(ctx.valid_frames)),
+        "Local_Frame_Index": local_frame_idx,
+        "Dataset_Progress_Pct": np.round(ds_progress_pct, 2),
         "Dataset": ctx.dataset_tags,
         "RMSD_to_Reference": rmsd_to_ref,
         "PCA_1": X_pca[:, 0],
