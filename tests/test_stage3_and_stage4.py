@@ -104,6 +104,30 @@ class TestStage3AndStage4(unittest.TestCase):
         cnn_labels = run_cnn(rmsd_mat, eps=1.0, min_samples=3)
         self.assertEqual(len(set(cnn_labels) - {-1}), 2)
 
+    def test_detect_sub_runs(self):
+        from metflow.stage3_reduction.allostery import detect_sub_runs
+
+        # Simulate 3 concatenated runs of 15 frames each inside dataset 't14_p1'
+        tags = ["t14_p1"] * 45
+        rmsd = np.concatenate([
+            np.linspace(0.5, 4.0, 15),
+            np.linspace(0.5, 3.8, 15),
+            np.linspace(0.5, 4.2, 15),
+        ])
+        pca = np.zeros((45, 3))
+        for start in (0, 15, 30):
+            pca[start:start + 15, 0] = np.linspace(1.0, 10.0, 15)
+            pca[start:start + 15, 1] = np.linspace(-2.0, 5.0, 15)
+
+        run_ids, run_frames, run_pct = detect_sub_runs(tags, rmsd, pca)
+        self.assertEqual(list(np.unique(run_ids)), [1, 2, 3])
+        self.assertEqual(run_frames[0], 0)
+        self.assertEqual(run_frames[15], 0)
+        self.assertEqual(run_frames[30], 0)
+        self.assertAlmostEqual(run_pct[14], 100.0)
+        self.assertAlmostEqual(run_pct[29], 100.0)
+        self.assertAlmostEqual(run_pct[44], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

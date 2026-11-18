@@ -462,11 +462,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             if (!globalData || globalData.length === 0) return;
             const hasLocal = cols.includes('Local_Frame_Index');
             const hasProg = cols.includes('Dataset_Progress_Pct');
-            if (hasLocal && hasProg) return;
+            const hasRunId = cols.includes('Detected_Run_ID');
+            const hasRunFrame = cols.includes('Run_Frame_Index');
+            const hasRunProg = cols.includes('Run_Progress_Pct');
+            if (hasLocal && hasProg && hasRunId && hasRunFrame && hasRunProg) return;
+
             const totals = {};
-            globalData.forEach(d => {
+            const dsGroups = {};
+            globalData.forEach((d, idx) => {
                 const ds = d['Dataset'] || 'Dataset';
                 totals[ds] = (totals[ds] || 0) + 1;
+                if (!dsGroups[ds]) dsGroups[ds] = [];
+                dsGroups[ds].push(idx);
             });
             const counts = {};
             globalData.forEach(d => {
@@ -477,8 +484,69 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 if (!hasProg) d['Dataset_Progress_Pct'] = tot > 1 ? Number((100.0 * k / (tot - 1)).toFixed(2)) : 0;
                 counts[ds] = k + 1;
             });
+
+            if (!hasRunId || !hasRunFrame || !hasRunProg) {
+                const pc1Col = cols.find(c => c.startsWith('PCA_1'));
+                const pc2Col = cols.find(c => c.startsWith('PCA_2'));
+                const pc3Col = cols.find(c => c.startsWith('PCA_3'));
+                Object.keys(dsGroups).forEach(ds => {
+                    const idxs = dsGroups[ds];
+                    if (idxs.length === 0) return;
+                    const d0 = globalData[idxs[0]];
+                    const r0 = Number(d0['RMSD_to_Reference']);
+                    const x0 = pc1Col ? Number(d0[pc1Col]) : 0;
+                    const y0 = pc2Col ? Number(d0[pc2Col]) : 0;
+                    const z0 = pc3Col ? Number(d0[pc3Col]) : 0;
+
+                    let currRun = 1;
+                    let lastReset = 0;
+                    const runStarts = [0];
+                    const rowRuns = new Array(idxs.length).fill(1);
+                    for (let pos = 1; pos < idxs.length; pos++) {
+                        const d = globalData[idxs[pos]];
+                        const dp = globalData[idxs[pos - 1]];
+                        const dr = Math.abs(Number(d['RMSD_to_Reference']) - r0);
+                        const dpx = (pc1Col ? Number(d[pc1Col]) - x0 : 0);
+                        const dpy = (pc2Col ? Number(d[pc2Col]) - y0 : 0);
+                        const dpz = (pc3Col ? Number(d[pc3Col]) - z0 : 0);
+                        const dist = Math.sqrt(dpx * dpx + dpy * dpy + dpz * dpz);
+
+                        const drPrev = Math.abs(Number(dp['RMSD_to_Reference']) - r0);
+                        const dpxPrev = (pc1Col ? Number(dp[pc1Col]) - x0 : 0);
+                        const dpyPrev = (pc2Col ? Number(dp[pc2Col]) - y0 : 0);
+                        const dpzPrev = (pc3Col ? Number(dp[pc3Col]) - z0 : 0);
+                        const distPrev = Math.sqrt(dpxPrev * dpxPrev + dpyPrev * dpyPrev + dpzPrev * dpzPrev);
+
+                        const isAtStart = (!isNaN(dr) && dr < 0.02) && (!isNaN(dist) && dist < 0.25);
+                        const wasAway = (!isNaN(distPrev) && distPrev > 0.4) || (!isNaN(drPrev) && drPrev > 0.05);
+                        if (isAtStart && wasAway && (pos - lastReset >= 10)) {
+                            currRun += 1;
+                            lastReset = pos;
+                            runStarts.push(pos);
+                        }
+                        rowRuns[pos] = currRun;
+                    }
+                    runStarts.push(idxs.length);
+                    for (let r = 0; r < runStarts.length - 1; r++) {
+                        const s = runStarts[r];
+                        const e = runStarts[r + 1];
+                        const rLen = e - s;
+                        for (let pos = s; pos < e; pos++) {
+                            const off = pos - s;
+                            const row = globalData[idxs[pos]];
+                            if (!hasRunId) row['Detected_Run_ID'] = rowRuns[pos];
+                            if (!hasRunFrame) row['Run_Frame_Index'] = off;
+                            if (!hasRunProg) row['Run_Progress_Pct'] = rLen > 1 ? Number((100.0 * off / (rLen - 1)).toFixed(2)) : 0;
+                        }
+                    }
+                });
+            }
+
             if (!hasLocal) cols.push('Local_Frame_Index');
             if (!hasProg) cols.push('Dataset_Progress_Pct');
+            if (!hasRunId) cols.push('Detected_Run_ID');
+            if (!hasRunFrame) cols.push('Run_Frame_Index');
+            if (!hasRunProg) cols.push('Run_Progress_Pct');
         }
 
         function populateDropdowns() {
@@ -629,9 +697,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             let validCount = validNums.length;
 
             const isEnergy = cColor.toLowerCase().includes('energy');
-            const isExplicitCategory = ['dataset', 'cluster', 'label', 'method'].some(k => cColor.toLowerCase().includes(k));
+            const isExplicitCategory = (cColor === 'Dataset' || ['cluster', 'label', 'method', 'run_id'].some(k => cColor.toLowerCase().includes(k)));
             const uniqueValCount = new Set(color.map(v => (v === null || v === undefined) ? '' : String(v).trim())).size;
-            const isCategory = isExplicitCategory || (!isEnergy && !['pca', 'rmsd', 'tsne', 'loading'].some(k => cColor.toLowerCase().includes(k)) && uniqueValCount <= 40);
+            const isCategory = isExplicitCategory || (!isEnergy && !['pca', 'rmsd', 'tsne', 'loading', 'frame', 'progress', 'pct'].some(k => cColor.toLowerCase().includes(k)) && uniqueValCount <= 40);
 
             if (isCategory) {
                 if (cmContainer) cmContainer.style.display = 'none';

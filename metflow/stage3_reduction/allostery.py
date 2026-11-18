@@ -224,6 +224,61 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
     return artifacts
 
 
+def detect_sub_runs(
+    dataset_tags: List[str],
+    rmsd_to_ref: np.ndarray,
+    X_pca: np.ndarray,
+) -> tuple:
+    """Detect concatenated replicate runs within each dataset from resets to frame 0."""
+    n = len(dataset_tags)
+    run_ids = np.ones(n, dtype=int)
+    run_frame_idx = np.zeros(n, dtype=int)
+    run_progress_pct = np.zeros(n, dtype=float)
+
+    # Group indices by dataset preserving order
+    ds_indices: dict = {}
+    for i, tag in enumerate(dataset_tags):
+        ds_indices.setdefault(tag, []).append(i)
+
+    for tag, idxs in ds_indices.items():
+        if not idxs:
+            continue
+        i0 = idxs[0]
+        r0 = float(rmsd_to_ref[i0])
+        p0 = X_pca[i0, :3]
+
+        curr_run = 1
+        last_reset_pos = 0
+        run_starts = [0]
+        for pos in range(1, len(idxs)):
+            gi = idxs[pos]
+            gi_prev = idxs[pos - 1]
+            dr = abs(float(rmsd_to_ref[gi]) - r0)
+            dp = float(np.linalg.norm(X_pca[gi, :3] - p0))
+            dr_prev = abs(float(rmsd_to_ref[gi_prev]) - r0)
+            dp_prev = float(np.linalg.norm(X_pca[gi_prev, :3] - p0))
+
+            is_at_start = (dr < 0.02 and dp < 0.25)
+            was_away = (dp_prev > 0.4 or dr_prev > 0.05)
+            if is_at_start and was_away and (pos - last_reset_pos >= 10):
+                curr_run += 1
+                last_reset_pos = pos
+                run_starts.append(pos)
+            run_ids[gi] = curr_run
+
+        run_starts.append(len(idxs))
+        for r_idx in range(len(run_starts) - 1):
+            s_pos = run_starts[r_idx]
+            e_pos = run_starts[r_idx + 1]
+            r_len = e_pos - s_pos
+            for offset, pos in enumerate(range(s_pos, e_pos)):
+                gi = idxs[pos]
+                run_frame_idx[gi] = offset
+                run_progress_pct[gi] = round((100.0 * offset / (r_len - 1)) if r_len > 1 else 0.0, 2)
+
+    return run_ids, run_frame_idx, run_progress_pct
+
+
 def run_stage3(ctx: TrajectoryContext) -> StageResult:
     """Execute Stage 3: streaming Kabsch export, global/ref PCA, and allostery."""
     coords_array, rmsd_to_ref = export_merged_trajectory(ctx)
@@ -264,10 +319,15 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
         ds_progress_pct[idx_f] = (100.0 * k_local / (tot_ds - 1)) if tot_ds > 1 else 0.0
         local_counts[tag] = k_local + 1
 
+    run_ids, run_frame_idx, run_progress_pct = detect_sub_runs(ctx.dataset_tags, rmsd_to_ref, X_pca)
+
     ctx.df_data = {
         "Frame_Index": np.arange(len(ctx.valid_frames)),
         "Local_Frame_Index": local_frame_idx,
         "Dataset_Progress_Pct": np.round(ds_progress_pct, 2),
+        "Detected_Run_ID": run_ids,
+        "Run_Frame_Index": run_frame_idx,
+        "Run_Progress_Pct": run_progress_pct,
         "Dataset": ctx.dataset_tags,
         "RMSD_to_Reference": rmsd_to_ref,
         "PCA_1": X_pca[:, 0],

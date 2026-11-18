@@ -1813,6 +1813,61 @@ def run_allostery(ctx: TrajectoryContext) -> List[str]:
     return artifacts
 
 
+def detect_sub_runs(
+    dataset_tags: List[str],
+    rmsd_to_ref: np.ndarray,
+    X_pca: np.ndarray,
+) -> tuple:
+    """Detect concatenated replicate runs within each dataset from resets to frame 0."""
+    n = len(dataset_tags)
+    run_ids = np.ones(n, dtype=int)
+    run_frame_idx = np.zeros(n, dtype=int)
+    run_progress_pct = np.zeros(n, dtype=float)
+
+    # Group indices by dataset preserving order
+    ds_indices: dict = {}
+    for i, tag in enumerate(dataset_tags):
+        ds_indices.setdefault(tag, []).append(i)
+
+    for tag, idxs in ds_indices.items():
+        if not idxs:
+            continue
+        i0 = idxs[0]
+        r0 = float(rmsd_to_ref[i0])
+        p0 = X_pca[i0, :3]
+
+        curr_run = 1
+        last_reset_pos = 0
+        run_starts = [0]
+        for pos in range(1, len(idxs)):
+            gi = idxs[pos]
+            gi_prev = idxs[pos - 1]
+            dr = abs(float(rmsd_to_ref[gi]) - r0)
+            dp = float(np.linalg.norm(X_pca[gi, :3] - p0))
+            dr_prev = abs(float(rmsd_to_ref[gi_prev]) - r0)
+            dp_prev = float(np.linalg.norm(X_pca[gi_prev, :3] - p0))
+
+            is_at_start = (dr < 0.02 and dp < 0.25)
+            was_away = (dp_prev > 0.4 or dr_prev > 0.05)
+            if is_at_start and was_away and (pos - last_reset_pos >= 10):
+                curr_run += 1
+                last_reset_pos = pos
+                run_starts.append(pos)
+            run_ids[gi] = curr_run
+
+        run_starts.append(len(idxs))
+        for r_idx in range(len(run_starts) - 1):
+            s_pos = run_starts[r_idx]
+            e_pos = run_starts[r_idx + 1]
+            r_len = e_pos - s_pos
+            for offset, pos in enumerate(range(s_pos, e_pos)):
+                gi = idxs[pos]
+                run_frame_idx[gi] = offset
+                run_progress_pct[gi] = round((100.0 * offset / (r_len - 1)) if r_len > 1 else 0.0, 2)
+
+    return run_ids, run_frame_idx, run_progress_pct
+
+
 def run_stage3(ctx: TrajectoryContext) -> StageResult:
     """Execute Stage 3: streaming Kabsch export, global/ref PCA, and allostery."""
     coords_array, rmsd_to_ref = export_merged_trajectory(ctx)
@@ -1853,10 +1908,15 @@ def run_stage3(ctx: TrajectoryContext) -> StageResult:
         ds_progress_pct[idx_f] = (100.0 * k_local / (tot_ds - 1)) if tot_ds > 1 else 0.0
         local_counts[tag] = k_local + 1
 
+    run_ids, run_frame_idx, run_progress_pct = detect_sub_runs(ctx.dataset_tags, rmsd_to_ref, X_pca)
+
     ctx.df_data = {
         "Frame_Index": np.arange(len(ctx.valid_frames)),
         "Local_Frame_Index": local_frame_idx,
         "Dataset_Progress_Pct": np.round(ds_progress_pct, 2),
+        "Detected_Run_ID": run_ids,
+        "Run_Frame_Index": run_frame_idx,
+        "Run_Progress_Pct": run_progress_pct,
         "Dataset": ctx.dataset_tags,
         "RMSD_to_Reference": rmsd_to_ref,
         "PCA_1": X_pca[:, 0],
@@ -3324,11 +3384,18 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             if (!globalData || globalData.length === 0) return;
             const hasLocal = cols.includes('Local_Frame_Index');
             const hasProg = cols.includes('Dataset_Progress_Pct');
-            if (hasLocal && hasProg) return;
+            const hasRunId = cols.includes('Detected_Run_ID');
+            const hasRunFrame = cols.includes('Run_Frame_Index');
+            const hasRunProg = cols.includes('Run_Progress_Pct');
+            if (hasLocal && hasProg && hasRunId && hasRunFrame && hasRunProg) return;
+
             const totals = {};
-            globalData.forEach(d => {
+            const dsGroups = {};
+            globalData.forEach((d, idx) => {
                 const ds = d['Dataset'] || 'Dataset';
                 totals[ds] = (totals[ds] || 0) + 1;
+                if (!dsGroups[ds]) dsGroups[ds] = [];
+                dsGroups[ds].push(idx);
             });
             const counts = {};
             globalData.forEach(d => {
@@ -3339,8 +3406,69 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
                 if (!hasProg) d['Dataset_Progress_Pct'] = tot > 1 ? Number((100.0 * k / (tot - 1)).toFixed(2)) : 0;
                 counts[ds] = k + 1;
             });
+
+            if (!hasRunId || !hasRunFrame || !hasRunProg) {
+                const pc1Col = cols.find(c => c.startsWith('PCA_1'));
+                const pc2Col = cols.find(c => c.startsWith('PCA_2'));
+                const pc3Col = cols.find(c => c.startsWith('PCA_3'));
+                Object.keys(dsGroups).forEach(ds => {
+                    const idxs = dsGroups[ds];
+                    if (idxs.length === 0) return;
+                    const d0 = globalData[idxs[0]];
+                    const r0 = Number(d0['RMSD_to_Reference']);
+                    const x0 = pc1Col ? Number(d0[pc1Col]) : 0;
+                    const y0 = pc2Col ? Number(d0[pc2Col]) : 0;
+                    const z0 = pc3Col ? Number(d0[pc3Col]) : 0;
+
+                    let currRun = 1;
+                    let lastReset = 0;
+                    const runStarts = [0];
+                    const rowRuns = new Array(idxs.length).fill(1);
+                    for (let pos = 1; pos < idxs.length; pos++) {
+                        const d = globalData[idxs[pos]];
+                        const dp = globalData[idxs[pos - 1]];
+                        const dr = Math.abs(Number(d['RMSD_to_Reference']) - r0);
+                        const dpx = (pc1Col ? Number(d[pc1Col]) - x0 : 0);
+                        const dpy = (pc2Col ? Number(d[pc2Col]) - y0 : 0);
+                        const dpz = (pc3Col ? Number(d[pc3Col]) - z0 : 0);
+                        const dist = Math.sqrt(dpx * dpx + dpy * dpy + dpz * dpz);
+
+                        const drPrev = Math.abs(Number(dp['RMSD_to_Reference']) - r0);
+                        const dpxPrev = (pc1Col ? Number(dp[pc1Col]) - x0 : 0);
+                        const dpyPrev = (pc2Col ? Number(dp[pc2Col]) - y0 : 0);
+                        const dpzPrev = (pc3Col ? Number(dp[pc3Col]) - z0 : 0);
+                        const distPrev = Math.sqrt(dpxPrev * dpxPrev + dpyPrev * dpyPrev + dpzPrev * dpzPrev);
+
+                        const isAtStart = (!isNaN(dr) && dr < 0.02) && (!isNaN(dist) && dist < 0.25);
+                        const wasAway = (!isNaN(distPrev) && distPrev > 0.4) || (!isNaN(drPrev) && drPrev > 0.05);
+                        if (isAtStart && wasAway && (pos - lastReset >= 10)) {
+                            currRun += 1;
+                            lastReset = pos;
+                            runStarts.push(pos);
+                        }
+                        rowRuns[pos] = currRun;
+                    }
+                    runStarts.push(idxs.length);
+                    for (let r = 0; r < runStarts.length - 1; r++) {
+                        const s = runStarts[r];
+                        const e = runStarts[r + 1];
+                        const rLen = e - s;
+                        for (let pos = s; pos < e; pos++) {
+                            const off = pos - s;
+                            const row = globalData[idxs[pos]];
+                            if (!hasRunId) row['Detected_Run_ID'] = rowRuns[pos];
+                            if (!hasRunFrame) row['Run_Frame_Index'] = off;
+                            if (!hasRunProg) row['Run_Progress_Pct'] = rLen > 1 ? Number((100.0 * off / (rLen - 1)).toFixed(2)) : 0;
+                        }
+                    }
+                });
+            }
+
             if (!hasLocal) cols.push('Local_Frame_Index');
             if (!hasProg) cols.push('Dataset_Progress_Pct');
+            if (!hasRunId) cols.push('Detected_Run_ID');
+            if (!hasRunFrame) cols.push('Run_Frame_Index');
+            if (!hasRunProg) cols.push('Run_Progress_Pct');
         }
 
         function populateDropdowns() {
@@ -3491,9 +3619,9 @@ DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
             let validCount = validNums.length;
 
             const isEnergy = cColor.toLowerCase().includes('energy');
-            const isExplicitCategory = ['dataset', 'cluster', 'label', 'method'].some(k => cColor.toLowerCase().includes(k));
+            const isExplicitCategory = (cColor === 'Dataset' || ['cluster', 'label', 'method', 'run_id'].some(k => cColor.toLowerCase().includes(k)));
             const uniqueValCount = new Set(color.map(v => (v === null || v === undefined) ? '' : String(v).trim())).size;
-            const isCategory = isExplicitCategory || (!isEnergy && !['pca', 'rmsd', 'tsne', 'loading'].some(k => cColor.toLowerCase().includes(k)) && uniqueValCount <= 40);
+            const isCategory = isExplicitCategory || (!isEnergy && !['pca', 'rmsd', 'tsne', 'loading', 'frame', 'progress', 'pct'].some(k => cColor.toLowerCase().includes(k)) && uniqueValCount <= 40);
 
             if (isCategory) {
                 if (cmContainer) cmContainer.style.display = 'none';
