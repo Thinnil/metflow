@@ -77,6 +77,8 @@ def heavy_atom_exclusion_expr(u_obj: Any) -> str:
 
 def extract_ca_atoms(u_obj: Any) -> Any:
     """Extract one C-alpha (or fallback) atom per protein residue."""
+    import MDAnalysis as mda
+
     if hasattr(u_obj, "select_atoms"):
         res_q = " ".join(PROTEIN_RESNAMES)
         excl = heavy_atom_exclusion_expr(u_obj)
