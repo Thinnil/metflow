@@ -283,6 +283,7 @@ class TestStage5AndStage6(unittest.TestCase):
                 res = run_stage5(ctx)
 
             self.assertTrue(res.success)
+            self.assertIsNone(fake_forcefield.createSystem.call_args.kwargs.get("constraints"))
             # Heavy atom (index 0, C) was frozen; Hydrogen (index 1, H) was NOT frozen
             fake_system.setParticleMass.assert_called_once_with(0, 0.0)
             # Check relax_steps logged as 25-step (never 0-step)

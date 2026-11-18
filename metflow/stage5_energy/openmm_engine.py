@@ -193,7 +193,9 @@ def run_openmm_energy(ctx: TrajectoryContext) -> Tuple[Dict[int, float], bool, L
         print("  -> Building reference system and compiling context...")
         ref_modeller = Modeller(fixer.topology, fixer.positions)
         ref_modeller.addHydrogens(forcefield)
-        system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds)
+        # Use constraints=None because heavy atoms are frozen (mass=0.0);
+        # OpenMM forbids HBonds constraints involving massless particles.
+        system = forcefield.createSystem(ref_modeller.topology, nonbondedMethod=NoCutoff, constraints=None)
 
         for a in ref_modeller.topology.atoms():
             if a.element.symbol != "H":
